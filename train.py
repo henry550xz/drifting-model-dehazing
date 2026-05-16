@@ -80,11 +80,21 @@ CIFAR10_CONFIG = {
 }
 
 
-def get_dataset(name: str, root: str = "/home/qingtianzhu.ty/drifting/data") -> tuple:
-    """Get dataset and transforms."""
+def get_dataset(
+    name: str,
+    root: Optional[str] = None,
+) -> tuple:
+    """Get dataset ands transforms.
+
+    If ``root`` is None, data is stored under ``./data`` next to this script
+    (override with ``--data-dir`` from the CLI).
+    """
+    if root is None:
+        root = str(Path(__file__).resolve().parent / "data")
     if name.lower() == "mnist":
-        # MNIST data is at {root}/mnist/MNIST/raw/
+        # MNIST is saved under {mnist_root}/MNIST/ when download=True
         mnist_root = os.path.join(root, "mnist")
+        os.makedirs(mnist_root, exist_ok=True)
         transform = transforms.Compose([
             transforms.Resize(32),
             transforms.ToTensor(),
