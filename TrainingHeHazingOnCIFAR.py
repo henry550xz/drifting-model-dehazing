@@ -91,9 +91,9 @@ def gaussian_blur(
 
 def apply_fog(
     image: torch.Tensor,
-    beta_range: Tuple[float, float] = (0.5, 1.6),
-    a_range: Tuple[float, float] = (0.72, 0.92),
-    blur_sigma_range: Tuple[float, float] = (0.05, 0.6),
+    beta_range: Tuple[float, float] = (2.2, 4.8),
+    a_range: Tuple[float, float] = (0.9, 1.0),
+    blur_sigma_range: Tuple[float, float] = (0.2, 1.0),
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     """Apply artificial fog to a batch of images.
@@ -153,9 +153,9 @@ class HazyCIFAR10(Dataset):
         root: str = "./data/cifar10",
         train: bool = True,
         img_size: int = 32,
-        beta_range: Tuple[float, float] = (0.45, 1.45),
-        a_range: Tuple[float, float] = (0.72, 0.9),
-        blur_sigma_range: Tuple[float, float] = (0.05, 0.55),
+        beta_range: Tuple[float, float] = (1.0, 2.8),
+        a_range: Tuple[float, float] = (0.85, 1.0),
+        blur_sigma_range: Tuple[float, float] = (0.0, 0.15),
         fixed_fog: bool = False,
     ):
         """
@@ -332,7 +332,8 @@ class DehazingDiT(nn.Module):
 
         x = x[:, self.num_register_tokens:, :]
         x = self.final_layer(x, c)
-        return self.unpatchify(x)
+        residual = self.unpatchify(x)
+        return (x_hazy + residual).clamp(-1.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -471,10 +472,14 @@ def train(
             x_clean = x_clean.to(device, non_blocking=True)
             x_hazy = x_hazy.to(device, non_blocking=True)
 
-            z = torch.randn_like(x_clean)
+            z = torch.zeros_like(x_clean)
             x_hat = model(z, x_hazy)
 
-            loss = conditional_drift_loss(x_hat, x_clean)
+            # recon_l1 = F.l1_loss(x_hat, x_clean)
+            # recon_l2 = F.mse_loss(x_hat, x_clean)
+            drift = conditional_drift_loss(x_hat, x_clean)
+            # loss = recon_l1 + 0.2 * recon_l2 + 0.02 * drift
+            loss = drift
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -551,7 +556,7 @@ def save_triple_grid(
     """Save a grid with rows of [clean | hazy | dehazed]."""
     was_training = model.training
     model.eval()
-    z = torch.randn_like(x_clean)
+    z = torch.zeros_like(x_clean)
     x_hat = model(z, x_hazy).clamp(-1.0, 1.0)
 
     # Interleave: clean_i, hazy_i, dehazed_i, clean_{i+1}, hazy_{i+1}, ...
@@ -567,7 +572,6 @@ def save_triple_grid(
 # 6. CLI
 # ---------------------------------------------------------------------------
 
-
 def main():
     p = argparse.ArgumentParser(description="CIFAR-10 dehazing toy example.")
     p.add_argument("--epochs", type=int, default=100)
@@ -582,7 +586,7 @@ def main():
     p.add_argument("--output_dir", type=str, default="./outputs/dehaze_cifar")
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--log_interval", type=int, default=100)
-    p.add_argument("--sample_interval", type=int, default= 1000,
+    p.add_argument("--sample_interval", type=int, default= 400,
                    help="Optional step interval for extra samples (0 = only save per epoch).")
     p.add_argument("--epoch_save_interval", type=int, default=20,
                    help="Save epoch samples/checkpoints every N epochs (0 = disable).")
