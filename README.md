@@ -61,6 +61,91 @@ CIFAR outputs include `samples/latest.png`, `samples/latest.txt`,
 `cifar_dehaze_samples.png`, `cifar_dehaze_samples.txt`, and
 `checkpoints/latest.pt` under `--save_dir`.
 
+### CIFAR-10 Synthetic Dehazing Ablations
+
+The unified `TrainingDeHazing.py` can compare fog strength, noise input,
+prediction target, supervised reconstruction weight, and model size.
+
+Mild fog, random noise, direct prediction, drift only:
+
+```bash
+python TrainingDeHazing.py \
+  --dataset cifar10 \
+  --fog_preset mild \
+  --noise_mode random \
+  --prediction_mode direct \
+  --lambda_l1 0.0 \
+  --model_preset small \
+  --batch_size 128 \
+  --epochs 20 \
+  --save_dir ./outputs/abl_A_mild_random_direct_drift \
+  --device cuda
+```
+
+Medium fog, zero noise, residual prediction, drift only:
+
+```bash
+python TrainingDeHazing.py \
+  --dataset cifar10 \
+  --fog_preset medium \
+  --noise_mode zero \
+  --prediction_mode residual \
+  --lambda_l1 0.0 \
+  --model_preset small \
+  --batch_size 128 \
+  --epochs 20 \
+  --save_dir ./outputs/abl_B_medium_zero_residual_drift \
+  --device cuda
+```
+
+Mild fog, zero noise, residual prediction, drift plus L1:
+
+```bash
+python TrainingDeHazing.py \
+  --dataset cifar10 \
+  --fog_preset mild \
+  --noise_mode zero \
+  --prediction_mode residual \
+  --lambda_l1 1.0 \
+  --lambda_l2 0.0 \
+  --model_preset small \
+  --batch_size 128 \
+  --epochs 20 \
+  --save_dir ./outputs/abl_C_mild_zero_residual_l1 \
+  --device cuda
+```
+
+Model-size comparisons:
+
+```bash
+python TrainingDeHazing.py \
+  --dataset cifar10 \
+  --fog_preset mild \
+  --noise_mode zero \
+  --prediction_mode residual \
+  --lambda_l1 1.0 \
+  --model_preset medium \
+  --batch_size 128 \
+  --epochs 20 \
+  --save_dir ./outputs/abl_D_medium_model \
+  --device cuda
+
+python TrainingDeHazing.py \
+  --dataset cifar10 \
+  --fog_preset mild \
+  --noise_mode zero \
+  --prediction_mode residual \
+  --lambda_l1 1.0 \
+  --model_preset large \
+  --batch_size 128 \
+  --epochs 20 \
+  --save_dir ./outputs/abl_E_large_model \
+  --device cuda
+```
+
+Each run writes `samples/latest.png`, `samples/latest.txt`,
+`checkpoints/latest.pt`, and `checkpoints/final.pt` under `--save_dir`.
+
 ### Sampling
 
 ```bash
