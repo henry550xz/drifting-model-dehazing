@@ -21,7 +21,8 @@ Create and activate a virtual environment, then install the project dependencies
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install torch torchvision einops
+pip install --upgrade pip
+pip install torch torchvision einops matplotlib tqdm pillow numpy
 ```
 
 Use the venv Python for project commands:
