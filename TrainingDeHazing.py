@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import shutil
 import time
@@ -77,7 +78,8 @@ def apply_selected_fog(
     a_range: Tuple[float, float],
     blur_sigma_range: Tuple[float, float],
     generator: Optional[torch.Generator] = None,
-) -> torch.Tensor:
+    return_meta: bool = False,
+) -> Any:
     if fog_type == "asm":
         return apply_fog(
             image,
@@ -85,6 +87,7 @@ def apply_selected_fog(
             a_range=a_range,
             blur_sigma_range=blur_sigma_range,
             generator=generator,
+            return_meta=return_meta,
         )
     if fog_type == "mcbm":
         return apply_mcbm_fog(
@@ -93,6 +96,7 @@ def apply_selected_fog(
             a_range=a_range,
             blur_sigma_range=blur_sigma_range,
             generator=generator,
+            return_meta=return_meta,
         )
     raise ValueError(f"Unknown fog type: {fog_type}")
 
@@ -568,6 +572,9 @@ def train(
     smoke_test: bool = False,
     max_steps: Optional[int] = None,
     recursive: bool = False,
+    save_fog_debug: bool = False,
+    fog_debug_dir: Optional[str] = None,
+    fog_debug_max_images: int = 8,
 ):
     """End-to-end training loop."""
     set_seed(seed)
@@ -644,6 +651,9 @@ def train(
         "epochs": epochs,
         "img_size": img_size,
         "in_channels": in_channels,
+        "save_fog_debug": save_fog_debug,
+        "fog_debug_dir": fog_debug_dir,
+        "fog_debug_max_images": fog_debug_max_images,
     }
 
     # In smoke-test mode, log every step so the user sees activity quickly.
@@ -668,6 +678,18 @@ def train(
         fixed_fog=True,
         recursive=recursive,
     )
+    if save_fog_debug:
+        save_fog_debug_outputs(
+            vis_set,
+            device=device,
+            fog_type=fog_type,
+            fog_preset=fog_preset,
+            fog_config=fog_config,
+            output_dir=out,
+            fog_debug_dir=fog_debug_dir,
+            max_images=fog_debug_max_images,
+            seed=seed,
+        )
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
@@ -715,6 +737,9 @@ def train(
                 "drift_positive_mode": drift_positive_mode,
                 "lambda_l1": lambda_l1,
                 "lambda_l2": lambda_l2,
+                "save_fog_debug": save_fog_debug,
+                "fog_debug_dir": fog_debug_dir,
+                "fog_debug_max_images": fog_debug_max_images,
             },
         }
 
@@ -851,6 +876,122 @@ def train(
 # ---------------------------------------------------------------------------
 # 5. Visualization
 # ---------------------------------------------------------------------------
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, list):
+        return [_json_ready(v) for v in value]
+    return value
+
+
+def _tensor_summary(tensor: torch.Tensor, include_values: bool = False) -> Dict[str, Any]:
+    flat = tensor.detach().float().cpu().reshape(-1)
+    summary: Dict[str, Any] = {
+        "min": float(flat.min().item()),
+        "max": float(flat.max().item()),
+        "mean": float(flat.mean().item()),
+    }
+    if include_values:
+        summary["values"] = [float(v) for v in flat.tolist()]
+    return summary
+
+
+def _save_debug_grid(
+    tensor: torch.Tensor,
+    path: Path,
+    nrow: int,
+    value_range: Tuple[float, float],
+) -> None:
+    if tensor.ndim == 3:
+        tensor = tensor.unsqueeze(1)
+    save_image_grid(
+        tensor.detach().cpu(),
+        str(path),
+        nrow=nrow,
+        normalize=True,
+        value_range=value_range,
+    )
+
+
+@torch.no_grad()
+def save_fog_debug_outputs(
+    dataset: Dataset,
+    device: torch.device,
+    fog_type: str,
+    fog_preset: str,
+    fog_config: Dict[str, Tuple[float, float]],
+    output_dir: Path,
+    fog_debug_dir: Optional[str],
+    max_images: int,
+    seed: int,
+) -> None:
+    if max_images <= 0:
+        print("[fog_debug] skipped because --fog_debug_max_images <= 0")
+        return
+    n = min(max_images, len(dataset))
+    debug_dir = Path(fog_debug_dir) if fog_debug_dir else output_dir / "fog_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    samples = [dataset[idx] for idx in range(n)]
+    x_clean = torch.stack([sample[0] for sample in samples], dim=0).to(device)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    x_hazy, meta = apply_selected_fog(
+        x_clean,
+        fog_type=fog_type,
+        beta_range=fog_config["beta_range"],
+        a_range=fog_config["a_range"],
+        blur_sigma_range=fog_config["blur_sigma_range"],
+        generator=generator,
+        return_meta=True,
+    )
+
+    nrow = max(1, int(math.ceil(math.sqrt(n))))
+    files: Dict[str, str] = {}
+    grids = [
+        ("clean", x_clean, (-1.0, 1.0)),
+        ("hazy", x_hazy, (-1.0, 1.0)),
+        ("depth", meta["depth"], (0.0, 1.0)),
+        ("transmission", meta["transmission"], (0.0, 1.0)),
+    ]
+    density_key = "beta_tilde" if "beta_tilde" in meta else "density" if "density" in meta else None
+    if density_key is not None:
+        grids.append(("density", meta[density_key], (0.0, 1.0)))
+
+    for name, tensor, value_range in grids:
+        path = debug_dir / f"{name}_grid.png"
+        _save_debug_grid(tensor, path, nrow=nrow, value_range=value_range)
+        files[name] = str(path)
+
+    scalar_keys = ["beta", "atmospheric_light", "alpha"]
+    map_keys = ["depth", "transmission"]
+    if density_key is not None:
+        map_keys.append(density_key)
+    summary = {
+        "fog_type": fog_type,
+        "fog_preset": fog_preset,
+        "fog_config": _json_ready(meta.get("fog_config", fog_config)),
+        "num_images": n,
+        "files": files,
+        "scalars": {
+            key: _tensor_summary(meta[key], include_values=True)
+            for key in scalar_keys
+            if key in meta and isinstance(meta[key], torch.Tensor)
+        },
+        "maps": {
+            key: _tensor_summary(meta[key])
+            for key in map_keys
+            if key in meta and isinstance(meta[key], torch.Tensor)
+        },
+    }
+    summary_path = debug_dir / "metadata_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"[fog_debug] saved fog debug grids and metadata to {debug_dir}")
 
 
 @torch.no_grad()
@@ -1010,6 +1151,12 @@ def main():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--recursive", action="store_true",
                    help="Recursively scan image files when --dataset folder.")
+    p.add_argument("--save_fog_debug", action="store_true",
+                   help="Save one small fog-generation debug batch before training.")
+    p.add_argument("--fog_debug_dir", type=str, default=None,
+                   help="Directory for fog debug grids. Default: <save_dir>/fog_debug.")
+    p.add_argument("--fog_debug_max_images", type=int, default=8,
+                   help="Maximum images to include in fog debug grids.")
     p.add_argument("--log_interval", type=int, default=100)
     p.add_argument("--sample_interval", type=int, default=400,
                    help="Optional step interval for extra samples (0 = only save per epoch).")
@@ -1061,6 +1208,9 @@ def main():
         smoke_test=args.smoke_test,
         max_steps=args.max_steps,
         recursive=args.recursive,
+        save_fog_debug=args.save_fog_debug,
+        fog_debug_dir=args.fog_debug_dir,
+        fog_debug_max_images=args.fog_debug_max_images,
     )
 
 

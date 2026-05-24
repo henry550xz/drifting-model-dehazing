@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -113,7 +113,8 @@ def apply_fog(
     a_range: Tuple[float, float] = (0.85, 1.0),
     blur_sigma_range: Tuple[float, float] = (0.5, 1.8),
     generator: Optional[torch.Generator] = None,
-) -> torch.Tensor:
+    return_meta: bool = False,
+) -> Any:
     """Apply artificial fog to a batch of images.
 
     The model is the standard atmospheric scattering equation
@@ -127,9 +128,11 @@ def apply_fog(
         blur_sigma_range:  Per-image range for Gaussian blur sigma (pixels).
                            Set (0.0, 0.0) to disable.
         generator:         Optional torch.Generator for reproducible fog.
+        return_meta:       If True, also return fog tensors and scalar settings.
 
     Returns:
-        Hazy image batch in [-1, 1], same shape as input.
+        Hazy image batch in [-1, 1], same shape as input. If return_meta=True,
+        returns (hazy, meta).
     """
     if image.ndim != 4:
         raise ValueError(f"apply_fog expects (B, C, H, W), got {tuple(image.shape)}")
@@ -164,4 +167,20 @@ def apply_fog(
             dim=0,
         )
 
-    return (i * 2.0 - 1.0).clamp(-1.0, 1.0)
+    x_hazy = (i * 2.0 - 1.0).clamp(-1.0, 1.0)
+    if not return_meta:
+        return x_hazy
+
+    meta = {
+        "depth": d.clamp(0.0, 1.0),
+        "transmission": t.clamp(0.0, 1.0),
+        "beta": beta,
+        "atmospheric_light": a,
+        "fog_type": "asm",
+        "fog_config": {
+            "beta_range": beta_range,
+            "a_range": a_range,
+            "blur_sigma_range": blur_sigma_range,
+        },
+    }
+    return x_hazy, meta

@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -59,7 +59,8 @@ def apply_mcbm_fog(
     a_range: Tuple[float, float] = (0.85, 1.0),
     blur_sigma_range: Tuple[float, float] = (0.5, 1.8),
     generator: Optional[torch.Generator] = None,
-) -> torch.Tensor:
+    return_meta: bool = False,
+) -> Any:
     """Apply MCBM-inspired non-homogeneous fog to a batch in [-1, 1]."""
     if image.ndim != 4:
         raise ValueError(f"apply_mcbm_fog expects (B, C, H, W), got {tuple(image.shape)}")
@@ -96,4 +97,22 @@ def apply_mcbm_fog(
             dim=0,
         )
 
-    return (i * 2.0 - 1.0).clamp(-1.0, 1.0)
+    x_hazy = (i * 2.0 - 1.0).clamp(-1.0, 1.0)
+    if not return_meta:
+        return x_hazy
+
+    meta = {
+        "depth": depth.clamp(0.0, 1.0),
+        "transmission": t_mcbm.clamp(0.0, 1.0),
+        "beta": beta,
+        "atmospheric_light": a,
+        "beta_tilde": beta_tilde.clamp(0.0, 1.0),
+        "alpha": alpha,
+        "fog_type": "mcbm",
+        "fog_config": {
+            "beta_range": beta_range,
+            "a_range": a_range,
+            "blur_sigma_range": blur_sigma_range,
+        },
+    }
+    return x_hazy, meta

@@ -40,11 +40,11 @@ python train.py --dataset cifar10
 
 ### Synthetic Dehazing Toy
 
-`TrainingDeHazing.py` supports the original hazy MNIST toy path and a first
-paired synthetic CIFAR-10 dehazing run. CIFAR images are normalized to `[-1, 1]`,
-fog is generated on the fly, and the dehazing model concatenates noise/degraded
-input with the hazy image, so CIFAR uses 3 output channels and 6 internal input
-channels at the patch embed.
+`TrainingDeHazing.py` supports the original hazy MNIST toy path, paired
+synthetic CIFAR-10 dehazing, and `--dataset folder` for real RGB image folders.
+CIFAR/folder images are normalized to `[-1, 1]`, fog is generated on the fly,
+and the dehazing model concatenates noise/degraded input with the hazy image, so
+RGB runs use 3 output channels and 6 internal input channels at the patch embed.
 
 ```bash
 # MNIST dehazing
@@ -55,6 +55,20 @@ python TrainingDeHazing.py --dataset cifar10 --data_dir ./data --batch_size 64 -
 
 # Tiny CIFAR smoke test
 python TrainingDeHazing.py --dataset cifar10 --data_dir ./data --batch_size 4 --epochs 1 --max_steps 1 --save_dir ./outputs/cifar_dehaze_smoke --device cpu --num_workers 0
+```
+
+Useful dehazing switches include `--fog_type {asm,mcbm}`,
+`--loss_mode {drift,supervised,mixed}`, and
+`--drift_positive_mode {batch,paired}`. Fog strength can be selected with
+`--fog_preset {mild,medium,heavy}`.
+
+Optional fog debug outputs can be saved before training with
+`--save_fog_debug`. Use `--fog_debug_dir` to choose the output directory
+(default: `<save_dir>/fog_debug`) and `--fog_debug_max_images` to cap the grid
+size.
+
+```bash
+python TrainingDeHazing.py --dataset cifar10 --fog_type mcbm --save_fog_debug --fog_debug_dir /tmp/dehaze_fog_debug_mcbm --fog_debug_max_images 4 --batch_size 2 --epochs 1 --max_steps 1 --save_dir /tmp/dehaze_smoke_debug --device cpu --num_workers 0
 ```
 
 CIFAR outputs include `samples/latest.png`, `samples/latest.txt`,
