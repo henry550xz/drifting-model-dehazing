@@ -12,9 +12,11 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 
 from drifting import compute_V
-from haze.asm import apply_fog, resolve_fog_config
+from haze.asm import apply_fog, make_flat_depth_map, resolve_fog_config
 from haze.mcbm import apply_mcbm_fog
 from model import DiTBlock, FinalLayer, PatchEmbed, RotaryPositionEmbedding
 from utils import EMA, WarmupLRScheduler, count_parameters, save_image_grid, set_seed
@@ -77,15 +79,31 @@ def apply_selected_fog(
     beta_range: Tuple[float, float],
     a_range: Tuple[float, float],
     blur_sigma_range: Tuple[float, float],
+    depth_mode: str = "synthetic",
+    depth: Optional[torch.Tensor] = None,
     generator: Optional[torch.Generator] = None,
     return_meta: bool = False,
 ) -> Any:
+    if depth is None:
+        if depth_mode == "synthetic":
+            fog_depth = None
+        elif depth_mode == "flat":
+            b, _, h, w = image.shape
+            fog_depth = make_flat_depth_map(b, h, w, image.device, image.dtype)
+        elif depth_mode == "external":
+            raise ValueError("depth_mode=external requires a depth tensor from the dataset.")
+        else:
+            raise ValueError(f"Unknown depth mode: {depth_mode}")
+    else:
+        fog_depth = depth
+
     if fog_type == "asm":
         return apply_fog(
             image,
             beta_range=beta_range,
             a_range=a_range,
             blur_sigma_range=blur_sigma_range,
+            depth=fog_depth,
             generator=generator,
             return_meta=return_meta,
         )
@@ -95,6 +113,7 @@ def apply_selected_fog(
             beta_range=beta_range,
             a_range=a_range,
             blur_sigma_range=blur_sigma_range,
+            depth=fog_depth,
             generator=generator,
             return_meta=return_meta,
         )
@@ -113,6 +132,7 @@ class HazyMNIST(Dataset):
         a_range: Tuple[float, float] = (0.85, 1.0),
         blur_sigma_range: Tuple[float, float] = (0.5, 1.8),
         fog_type: str = "asm",
+        depth_mode: str = "synthetic",
         fixed_fog: bool = False,
     ):
         """
@@ -131,7 +151,10 @@ class HazyMNIST(Dataset):
         self.a_range = a_range
         self.blur_sigma_range = blur_sigma_range
         self.fog_type = fog_type
+        self.depth_mode = depth_mode
         self.fixed_fog = fixed_fog
+        if self.depth_mode == "external":
+            raise ValueError("external depth is only supported for folder dataset for now.")
 
     def __len__(self) -> int:
         return len(self.base)
@@ -148,6 +171,7 @@ class HazyMNIST(Dataset):
             beta_range=self.beta_range,
             a_range=self.a_range,
             blur_sigma_range=self.blur_sigma_range,
+            depth_mode=self.depth_mode,
             generator=gen,
         )
         return x_clean.squeeze(0), x_hazy.squeeze(0), int(label)
@@ -164,6 +188,7 @@ class HazyCIFAR10(Dataset):
         a_range: Tuple[float, float] = (0.85, 1.0),
         blur_sigma_range: Tuple[float, float] = (0.5, 1.8),
         fog_type: str = "asm",
+        depth_mode: str = "synthetic",
         fixed_fog: bool = False,
     ):
         transform = transforms.Compose([
@@ -175,7 +200,10 @@ class HazyCIFAR10(Dataset):
         self.a_range = a_range
         self.blur_sigma_range = blur_sigma_range
         self.fog_type = fog_type
+        self.depth_mode = depth_mode
         self.fixed_fog = fixed_fog
+        if self.depth_mode == "external":
+            raise ValueError("external depth is only supported for folder dataset for now.")
 
     def __len__(self) -> int:
         return len(self.base)
@@ -194,6 +222,7 @@ class HazyCIFAR10(Dataset):
             beta_range=self.beta_range,
             a_range=self.a_range,
             blur_sigma_range=self.blur_sigma_range,
+            depth_mode=self.depth_mode,
             generator=gen,
         )
         return x_clean.squeeze(0), x_hazy.squeeze(0), int(label)
@@ -203,6 +232,7 @@ class RealRGBFolderDataset(Dataset):
     """RGB image folder wrapped with on-the-fly fog. Returns (x_clean, x_hazy, -1)."""
 
     IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+    DEPTH_EXTENSIONS = (".png", ".jpg", ".jpeg", ".npy", ".pt")
 
     def __init__(
         self,
@@ -213,13 +243,23 @@ class RealRGBFolderDataset(Dataset):
         a_range: Tuple[float, float] = (0.85, 1.0),
         blur_sigma_range: Tuple[float, float] = (0.5, 1.8),
         fog_type: str = "asm",
+        depth_mode: str = "synthetic",
+        depth_dir: Optional[str] = None,
         fixed_fog: bool = False,
         recursive: bool = False,
     ):
         self.root = Path(root)
         self.img_size = img_size
+        self.train = train
+        self.depth_mode = depth_mode
+        self.depth_dir = Path(depth_dir) if depth_dir is not None else None
         if not self.root.exists():
             raise FileNotFoundError(f"Image folder does not exist: {self.root}")
+        if self.depth_mode == "external":
+            if self.depth_dir is None:
+                raise ValueError("--depth_mode external requires --depth_dir.")
+            if not self.depth_dir.exists():
+                raise FileNotFoundError(f"Depth folder does not exist: {self.depth_dir}")
         iterator = self.root.rglob("*") if recursive else self.root.iterdir()
         self.paths = sorted(
             path
@@ -234,13 +274,6 @@ class RealRGBFolderDataset(Dataset):
                 f"Supported extensions: {extensions}"
             )
 
-        crop = transforms.RandomCrop(img_size) if train else transforms.CenterCrop(img_size)
-        self.transform = transforms.Compose([
-            transforms.Resize(img_size),
-            crop,
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # -> [-1, 1]
-        ])
         self.beta_range = beta_range
         self.a_range = a_range
         self.blur_sigma_range = blur_sigma_range
@@ -250,13 +283,151 @@ class RealRGBFolderDataset(Dataset):
     def __len__(self) -> int:
         return len(self.paths)
 
+    def _resolve_depth_path(self, image_path: Path) -> Path:
+        if self.depth_dir is None:
+            raise ValueError("--depth_mode external requires --depth_dir.")
+        rel_path = image_path.relative_to(self.root)
+
+        # Matching is intentionally simple and deterministic:
+        # 1. mirror the RGB relative path under depth_dir, first with the same
+        #    suffix and then with common depth suffixes;
+        # 2. fall back to root-level files that share the RGB stem.
+        candidates = [self.depth_dir / rel_path]
+        candidates.extend(self.depth_dir / rel_path.with_suffix(ext) for ext in self.DEPTH_EXTENSIONS)
+        candidates.extend(self.depth_dir / f"{image_path.stem}{ext}" for ext in self.DEPTH_EXTENSIONS)
+
+        seen = set()
+        unique_candidates = []
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            unique_candidates.append(candidate)
+            if candidate.exists() and candidate.is_file():
+                return candidate
+
+        tried = ", ".join(str(path) for path in unique_candidates[:8])
+        if len(unique_candidates) > 8:
+            tried += ", ..."
+        raise FileNotFoundError(
+            f"No matching depth file found for {image_path}. "
+            f"Looked under {self.depth_dir} using mirrored relative paths and same-stem files. "
+            f"Tried: {tried}"
+        )
+
+    @staticmethod
+    def _depth_tensor_from_array(depth: Any, source: Path) -> torch.Tensor:
+        if isinstance(depth, dict):
+            for key in ("depth", "depth_map", "map"):
+                if key in depth:
+                    depth = depth[key]
+                    break
+            else:
+                raise ValueError(f"Depth file {source} is a dict without a depth/depth_map/map key.")
+        if not torch.is_tensor(depth):
+            depth = torch.as_tensor(depth)
+        depth = depth.detach().float().cpu()
+        if depth.ndim == 4 and depth.shape[0] == 1:
+            depth = depth.squeeze(0)
+        if depth.ndim == 2:
+            depth = depth.unsqueeze(0)
+        elif depth.ndim == 3:
+            if depth.shape[0] in (1, 3, 4):
+                pass
+            elif depth.shape[-1] in (1, 3, 4):
+                depth = depth.permute(2, 0, 1)
+            else:
+                raise ValueError(f"Unsupported depth shape in {source}: {tuple(depth.shape)}")
+            if depth.shape[0] != 1:
+                depth = depth[:3].mean(dim=0, keepdim=True)
+        else:
+            raise ValueError(f"Unsupported depth shape in {source}: {tuple(depth.shape)}")
+        return depth
+
+    def _load_external_depth(self, image_path: Path) -> torch.Tensor:
+        depth_path = self._resolve_depth_path(image_path)
+        suffix = depth_path.suffix.lower()
+        if suffix in (".png", ".jpg", ".jpeg"):
+            with Image.open(depth_path) as depth_image:
+                return TF.to_tensor(depth_image.convert("L"))
+        if suffix == ".npy":
+            import numpy as np
+
+            return self._depth_tensor_from_array(np.load(depth_path), depth_path)
+        if suffix == ".pt":
+            return self._depth_tensor_from_array(torch.load(depth_path, map_location="cpu"), depth_path)
+        raise ValueError(f"Unsupported depth extension for {depth_path}; expected {self.DEPTH_EXTENSIONS}")
+
+    @staticmethod
+    def _normalize_depth_tensor(depth: torch.Tensor) -> torch.Tensor:
+        depth = torch.nan_to_num(depth.float(), nan=0.0, posinf=1.0, neginf=0.0)
+        d_min = depth.amin(dim=(1, 2), keepdim=True)
+        d_max = depth.amax(dim=(1, 2), keepdim=True)
+        d_range = d_max - d_min
+        already_normalized = (d_min >= 0.0) & (d_max <= 1.0)
+        constant_map = d_range <= 1e-6
+        scaled = (depth - d_min) / (d_range + 1e-6)
+        clamped = depth.clamp(0.0, 1.0)
+        return torch.where(already_normalized | constant_map, clamped, scaled.clamp(0.0, 1.0))
+
+    def _transform_image_and_depth(
+        self,
+        image: Image.Image,
+        depth: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        image = TF.resize(image, self.img_size, interpolation=InterpolationMode.BILINEAR)
+        resized_width, resized_height = TF.get_image_size(image)
+        if depth is not None:
+            depth = TF.resize(
+                depth,
+                [resized_height, resized_width],
+                interpolation=InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+
+        if self.train:
+            crop_i, crop_j, crop_h, crop_w = transforms.RandomCrop.get_params(
+                image,
+                (self.img_size, self.img_size),
+            )
+        else:
+            crop_h = crop_w = self.img_size
+            crop_i = max(0, int(round((resized_height - crop_h) / 2.0)))
+            crop_j = max(0, int(round((resized_width - crop_w) / 2.0)))
+
+        image = TF.crop(image, crop_i, crop_j, crop_h, crop_w)
+        if depth is not None:
+            depth = TF.crop(depth, crop_i, crop_j, crop_h, crop_w)
+            depth = self._normalize_depth_tensor(depth)
+
+        x_clean = TF.to_tensor(image)
+        x_clean = TF.normalize(x_clean, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])  # -> [-1, 1]
+        return x_clean, depth
+
+    def _load_transformed_sample(self, idx: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        image_path = self.paths[idx]
+        with Image.open(image_path) as image:
+            depth = self._load_external_depth(image_path) if self.depth_mode == "external" else None
+            return self._transform_image_and_depth(image.convert("RGB"), depth)
+
+    def fog_depth_for_index(self, idx: int) -> Optional[torch.Tensor]:
+        if self.depth_mode != "external":
+            return None
+        _, depth = self._load_transformed_sample(idx)
+        return depth
+
     def __getitem__(self, idx: int):
-        with Image.open(self.paths[idx]) as image:
-            x_clean = self.transform(image.convert("RGB"))
+        x_clean, depth = self._load_transformed_sample(idx)
         expected_shape = (3, self.img_size, self.img_size)
         if tuple(x_clean.shape) != expected_shape:
             raise ValueError(f"Folder sample should be {expected_shape}, got {tuple(x_clean.shape)}")
+        if depth is not None and tuple(depth.shape) != (1, self.img_size, self.img_size):
+            raise ValueError(
+                f"External depth sample should be {(1, self.img_size, self.img_size)}, "
+                f"got {tuple(depth.shape)}"
+            )
         x_clean = x_clean.unsqueeze(0)
+        fog_depth = depth.unsqueeze(0) if depth is not None else None
         gen = None
         if self.fixed_fog:
             gen = torch.Generator(device=x_clean.device).manual_seed(int(idx))
@@ -266,6 +437,8 @@ class RealRGBFolderDataset(Dataset):
             beta_range=self.beta_range,
             a_range=self.a_range,
             blur_sigma_range=self.blur_sigma_range,
+            depth_mode=self.depth_mode,
+            depth=fog_depth,
             generator=gen,
         )
         return x_clean.squeeze(0), x_hazy.squeeze(0), -1
@@ -278,6 +451,8 @@ def build_hazy_dataset(
     img_size: int,
     fog_config: Dict[str, Tuple[float, float]],
     fog_type: str = "asm",
+    depth_mode: str = "synthetic",
+    depth_dir: Optional[str] = None,
     fixed_fog: bool = False,
     recursive: bool = False,
 ) -> Dataset:
@@ -291,6 +466,7 @@ def build_hazy_dataset(
             a_range=fog_config["a_range"],
             blur_sigma_range=fog_config["blur_sigma_range"],
             fog_type=fog_type,
+            depth_mode=depth_mode,
             fixed_fog=fixed_fog,
         )
     if name in ("cifar", "cifar10"):
@@ -303,6 +479,7 @@ def build_hazy_dataset(
             a_range=fog_config["a_range"],
             blur_sigma_range=fog_config["blur_sigma_range"],
             fog_type=fog_type,
+            depth_mode=depth_mode,
             fixed_fog=fixed_fog,
         )
     if name == "folder":
@@ -314,6 +491,8 @@ def build_hazy_dataset(
             a_range=fog_config["a_range"],
             blur_sigma_range=fog_config["blur_sigma_range"],
             fog_type=fog_type,
+            depth_mode=depth_mode,
+            depth_dir=depth_dir,
             fixed_fog=fixed_fog,
             recursive=recursive,
         )
@@ -550,6 +729,8 @@ def train(
     model_preset: str = "small",
     fog_preset: Optional[str] = None,
     fog_type: str = "asm",
+    depth_mode: str = "synthetic",
+    depth_dir: Optional[str] = None,
     noise_mode: str = "random",
     prediction_mode: str = "direct",
     loss_mode: str = "drift",
@@ -582,6 +763,11 @@ def train(
     in_channels = dataset_channels(name)
     if name in ("cifar", "cifar10"):
         img_size = 32
+    if depth_mode == "external":
+        if name != "folder":
+            raise ValueError("external depth is only supported for folder dataset for now.")
+        if depth_dir is None:
+            raise ValueError("--depth_mode external requires --depth_dir.")
     if loss_mode == "supervised" and lambda_l1 == 0.0 and lambda_l2 == 0.0:
         raise ValueError(
             "loss_mode=supervised requires at least one supervised weight; "
@@ -624,7 +810,7 @@ def train(
     print(
         "Ablation config: "
         f"fog={fog_preset}, fog_type={fog_type}, beta={fog_config['beta_range']}, "
-        f"blur={fog_config['blur_sigma_range']}, "
+        f"blur={fog_config['blur_sigma_range']}, depth_mode={depth_mode}, "
         f"noise={noise_mode}, prediction={prediction_mode}, loss_mode={loss_mode}, "
         f"drift_positive_mode={drift_positive_mode}, "
         f"lambda_l1={lambda_l1}, lambda_l2={lambda_l2}"
@@ -634,6 +820,8 @@ def train(
         "dataset": name,
         "fog_preset": fog_preset,
         "fog_type": fog_type,
+        "depth_mode": depth_mode,
+        "depth_dir": depth_dir,
         "beta_range": fog_config["beta_range"],
         "a_range": fog_config["a_range"],
         "blur_sigma_range": fog_config["blur_sigma_range"],
@@ -666,6 +854,8 @@ def train(
         img_size=img_size,
         fog_config=fog_config,
         fog_type=fog_type,
+        depth_mode=depth_mode,
+        depth_dir=depth_dir,
         recursive=recursive,
     )
     vis_set = build_hazy_dataset(
@@ -675,6 +865,8 @@ def train(
         img_size=img_size,
         fog_config=fog_config,
         fog_type=fog_type,
+        depth_mode=depth_mode,
+        depth_dir=depth_dir,
         fixed_fog=True,
         recursive=recursive,
     )
@@ -683,6 +875,7 @@ def train(
             vis_set,
             device=device,
             fog_type=fog_type,
+            depth_mode=depth_mode,
             fog_preset=fog_preset,
             fog_config=fog_config,
             output_dir=out,
@@ -728,6 +921,8 @@ def train(
                 "model_preset": model_preset,
                 "fog_preset": fog_preset,
                 "fog_type": fog_type,
+                "depth_mode": depth_mode,
+                "depth_dir": depth_dir,
                 "beta_range": fog_config["beta_range"],
                 "a_range": fog_config["a_range"],
                 "blur_sigma_range": fog_config["blur_sigma_range"],
@@ -924,6 +1119,7 @@ def save_fog_debug_outputs(
     dataset: Dataset,
     device: torch.device,
     fog_type: str,
+    depth_mode: str,
     fog_preset: str,
     fog_config: Dict[str, Tuple[float, float]],
     output_dir: Path,
@@ -940,6 +1136,15 @@ def save_fog_debug_outputs(
 
     samples = [dataset[idx] for idx in range(n)]
     x_clean = torch.stack([sample[0] for sample in samples], dim=0).to(device)
+    depth = None
+    if depth_mode == "external":
+        depth_getter = getattr(dataset, "fog_depth_for_index", None)
+        if depth_getter is None:
+            raise ValueError("depth_mode=external requires a dataset that can provide fog depth maps.")
+        depth_items = [depth_getter(idx) for idx in range(n)]
+        if any(item is None for item in depth_items):
+            raise ValueError("depth_mode=external did not provide depth maps for fog debug.")
+        depth = torch.stack(depth_items, dim=0).to(device)
     generator = torch.Generator(device=device).manual_seed(seed)
     x_hazy, meta = apply_selected_fog(
         x_clean,
@@ -947,6 +1152,8 @@ def save_fog_debug_outputs(
         beta_range=fog_config["beta_range"],
         a_range=fog_config["a_range"],
         blur_sigma_range=fog_config["blur_sigma_range"],
+        depth_mode=depth_mode,
+        depth=depth,
         generator=generator,
         return_meta=True,
     )
@@ -974,6 +1181,7 @@ def save_fog_debug_outputs(
         map_keys.append(density_key)
     summary = {
         "fog_type": fog_type,
+        "depth_mode": depth_mode,
         "fog_preset": fog_preset,
         "fog_config": _json_ready(meta.get("fog_config", fog_config)),
         "num_images": n,
@@ -1090,6 +1298,8 @@ def save_metrics(path: Path, metrics: Dict[str, float], run_config: Dict[str, An
         "dataset",
         "fog_preset",
         "fog_type",
+        "depth_mode",
+        "depth_dir",
         "beta_range",
         "blur_sigma_range",
         "noise_mode",
@@ -1137,6 +1347,9 @@ def main():
     p.add_argument("--fog_preset", choices=["mild", "medium", "heavy"], default=None,
                    help="Default: mild for CIFAR-10, heavy/original for MNIST.")
     p.add_argument("--fog_type", choices=["asm", "mcbm"], default="asm")
+    p.add_argument("--depth_mode", choices=["synthetic", "flat", "external"], default="synthetic")
+    p.add_argument("--depth_dir", type=str, default=None,
+                   help="Folder of external depth maps. Required when --depth_mode external.")
     p.add_argument("--noise_mode", choices=["random", "zero"], default="random")
     p.add_argument("--prediction_mode", choices=["direct", "residual"], default="direct")
     p.add_argument("--loss_mode", choices=["drift", "supervised", "mixed"], default="drift")
@@ -1189,6 +1402,8 @@ def main():
         model_preset=args.model_preset,
         fog_preset=args.fog_preset,
         fog_type=args.fog_type,
+        depth_mode=args.depth_mode,
+        depth_dir=args.depth_dir,
         noise_mode=args.noise_mode,
         prediction_mode=args.prediction_mode,
         loss_mode=args.loss_mode,

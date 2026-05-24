@@ -23,6 +23,8 @@ FOG_PRESETS: Dict[str, Dict[str, Tuple[float, float]]] = {
     },
 }
 
+FLAT_DEPTH_VALUE = 0.5
+
 
 def resolve_fog_config(dataset: str, fog_preset: Optional[str]) -> Tuple[str, Dict[str, Tuple[float, float]]]:
     """Resolve dataset-aware fog preset while keeping old MNIST defaults."""
@@ -72,6 +74,72 @@ def _make_depth_map(
     return (d - d_min) / (d_max - d_min + 1e-6)
 
 
+def _normalize_depth_values(depth: torch.Tensor) -> torch.Tensor:
+    """Clamp already-normalized depth or min-max scale raw depth to [0, 1]."""
+    if depth.ndim < 2:
+        raise ValueError(f"Depth map must have at least 2 dimensions, got {tuple(depth.shape)}")
+    depth = torch.nan_to_num(depth.float(), nan=0.0, posinf=1.0, neginf=0.0)
+    reduce_dims = tuple(range(depth.ndim - 2, depth.ndim))
+    d_min = depth.amin(dim=reduce_dims, keepdim=True)
+    d_max = depth.amax(dim=reduce_dims, keepdim=True)
+    d_range = d_max - d_min
+    already_normalized = (d_min >= 0.0) & (d_max <= 1.0)
+    constant_map = d_range <= 1e-6
+    scaled = (depth - d_min) / (d_range + 1e-6)
+    clamped = depth.clamp(0.0, 1.0)
+    return torch.where(already_normalized | constant_map, clamped, scaled.clamp(0.0, 1.0))
+
+
+def make_flat_depth_map(
+    batch_size: int,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Constant depth map used by flat-depth ablations."""
+    return torch.full(
+        (batch_size, 1, height, width),
+        FLAT_DEPTH_VALUE,
+        device=device,
+        dtype=dtype,
+    ).clamp(0.0, 1.0)
+
+
+def _coerce_depth_map(
+    depth: torch.Tensor,
+    batch_size: int,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Convert optional caller-supplied depth to normalized (B, 1, H, W)."""
+    d = depth.to(device=device, dtype=dtype)
+    if d.ndim == 2:
+        d = d.unsqueeze(0).unsqueeze(0)
+    elif d.ndim == 3:
+        if d.shape[0] == batch_size and d.shape[1:] == (height, width):
+            d = d.unsqueeze(1)
+        else:
+            d = d.unsqueeze(0)
+    elif d.ndim != 4:
+        raise ValueError(f"Depth map must be 2D, 3D, or 4D, got {tuple(depth.shape)}")
+
+    if d.shape[1] != 1:
+        if d.shape[1] in (3, 4):
+            d = d[:, :3].mean(dim=1, keepdim=True)
+        else:
+            raise ValueError(f"Depth map channel dimension must be 1, 3, or 4, got {d.shape[1]}")
+    if d.shape[0] == 1 and batch_size > 1:
+        d = d.expand(batch_size, -1, -1, -1)
+    if d.shape[0] != batch_size:
+        raise ValueError(f"Depth batch size {d.shape[0]} does not match image batch size {batch_size}")
+    if d.shape[2:] != (height, width):
+        d = F.interpolate(d, size=(height, width), mode="bilinear", align_corners=False)
+    return _normalize_depth_values(d)
+
+
 def _gaussian_kernel1d(sigma: float, device: torch.device) -> torch.Tensor:
     """1D Gaussian kernel, radius = ceil(3 * sigma)."""
     radius = max(1, int(math.ceil(3.0 * sigma)))
@@ -112,6 +180,7 @@ def apply_fog(
     beta_range: Tuple[float, float] = (3.5, 7),
     a_range: Tuple[float, float] = (0.85, 1.0),
     blur_sigma_range: Tuple[float, float] = (0.5, 1.8),
+    depth: Optional[torch.Tensor] = None,
     generator: Optional[torch.Generator] = None,
     return_meta: bool = False,
 ) -> Any:
@@ -127,6 +196,8 @@ def apply_fog(
         a_range:           Per-image range for atmospheric light A (closer to 1 = whiter).
         blur_sigma_range:  Per-image range for Gaussian blur sigma (pixels).
                            Set (0.0, 0.0) to disable.
+        depth:             Optional depth tensor. If omitted, the synthetic
+                           depth generator preserves the previous behavior.
         generator:         Optional torch.Generator for reproducible fog.
         return_meta:       If True, also return fog tensors and scalar settings.
 
@@ -150,7 +221,10 @@ def apply_fog(
     a = torch.empty(b, 1, 1, 1, device=device)
     a.uniform_(a_range[0], a_range[1], generator=generator)
 
-    d = _make_depth_map(b, h, w, device, generator=generator)
+    if depth is None:
+        d = _make_depth_map(b, h, w, device, generator=generator)
+    else:
+        d = _coerce_depth_map(depth, b, h, w, device, j.dtype)
     t = torch.exp(-beta * d)
 
     i = j * t + a * (1.0 - t)

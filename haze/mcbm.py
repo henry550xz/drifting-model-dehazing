@@ -2,7 +2,7 @@ from typing import Any, Optional, Tuple
 
 import torch
 
-from .asm import _make_depth_map, gaussian_blur
+from .asm import _coerce_depth_map, _make_depth_map, gaussian_blur
 
 
 def generate_mcbm_beta_map(
@@ -58,6 +58,7 @@ def apply_mcbm_fog(
     beta_range: Tuple[float, float] = (3.5, 7.0),
     a_range: Tuple[float, float] = (0.85, 1.0),
     blur_sigma_range: Tuple[float, float] = (0.5, 1.8),
+    depth: Optional[torch.Tensor] = None,
     generator: Optional[torch.Generator] = None,
     return_meta: bool = False,
 ) -> Any:
@@ -81,7 +82,10 @@ def apply_mcbm_fog(
     a.uniform_(a_range[0], a_range[1], generator=generator)
 
     beta_tilde = generate_mcbm_beta_map(b, h, w, device, generator=generator)
-    depth = _make_depth_map(b, h, w, device, generator=generator)
+    if depth is None:
+        depth = _make_depth_map(b, h, w, device, generator=generator)
+    else:
+        depth = _coerce_depth_map(depth, b, h, w, device, j.dtype)
     t_mcbm = torch.exp(-(beta + alpha * beta_tilde) * depth)
 
     i = j * t_mcbm + a * (1.0 - t_mcbm)
