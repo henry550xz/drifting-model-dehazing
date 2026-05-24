@@ -14,6 +14,7 @@ from torchvision import datasets, transforms
 
 from drifting import compute_V
 from haze.asm import apply_fog, resolve_fog_config
+from haze.mcbm import apply_mcbm_fog
 from model import DiTBlock, FinalLayer, PatchEmbed, RotaryPositionEmbedding
 from utils import EMA, WarmupLRScheduler, count_parameters, save_image_grid, set_seed
 
@@ -69,6 +70,33 @@ def apply_prediction_mode(
     raise ValueError(f"Unknown prediction mode: {prediction_mode}")
 
 
+def apply_selected_fog(
+    image: torch.Tensor,
+    fog_type: str,
+    beta_range: Tuple[float, float],
+    a_range: Tuple[float, float],
+    blur_sigma_range: Tuple[float, float],
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    if fog_type == "asm":
+        return apply_fog(
+            image,
+            beta_range=beta_range,
+            a_range=a_range,
+            blur_sigma_range=blur_sigma_range,
+            generator=generator,
+        )
+    if fog_type == "mcbm":
+        return apply_mcbm_fog(
+            image,
+            beta_range=beta_range,
+            a_range=a_range,
+            blur_sigma_range=blur_sigma_range,
+            generator=generator,
+        )
+    raise ValueError(f"Unknown fog type: {fog_type}")
+
+
 class HazyMNIST(Dataset):
     """MNIST wrapped with on-the-fly fog. Returns (x_clean, x_hazy, label)."""
 
@@ -80,6 +108,7 @@ class HazyMNIST(Dataset):
         beta_range: Tuple[float, float] = (2.0, 4.5),
         a_range: Tuple[float, float] = (0.85, 1.0),
         blur_sigma_range: Tuple[float, float] = (0.5, 1.8),
+        fog_type: str = "asm",
         fixed_fog: bool = False,
     ):
         """
@@ -97,6 +126,7 @@ class HazyMNIST(Dataset):
         self.beta_range = beta_range
         self.a_range = a_range
         self.blur_sigma_range = blur_sigma_range
+        self.fog_type = fog_type
         self.fixed_fog = fixed_fog
 
     def __len__(self) -> int:
@@ -108,8 +138,9 @@ class HazyMNIST(Dataset):
         gen = None
         if self.fixed_fog:
             gen = torch.Generator(device=x_clean.device).manual_seed(int(idx))
-        x_hazy = apply_fog(
+        x_hazy = apply_selected_fog(
             x_clean,
+            fog_type=self.fog_type,
             beta_range=self.beta_range,
             a_range=self.a_range,
             blur_sigma_range=self.blur_sigma_range,
@@ -128,6 +159,7 @@ class HazyCIFAR10(Dataset):
         beta_range: Tuple[float, float] = (3.5, 7.0),
         a_range: Tuple[float, float] = (0.85, 1.0),
         blur_sigma_range: Tuple[float, float] = (0.5, 1.8),
+        fog_type: str = "asm",
         fixed_fog: bool = False,
     ):
         transform = transforms.Compose([
@@ -138,6 +170,7 @@ class HazyCIFAR10(Dataset):
         self.beta_range = beta_range
         self.a_range = a_range
         self.blur_sigma_range = blur_sigma_range
+        self.fog_type = fog_type
         self.fixed_fog = fixed_fog
 
     def __len__(self) -> int:
@@ -151,8 +184,9 @@ class HazyCIFAR10(Dataset):
         gen = None
         if self.fixed_fog:
             gen = torch.Generator(device=x_clean.device).manual_seed(int(idx))
-        x_hazy = apply_fog(
+        x_hazy = apply_selected_fog(
             x_clean,
+            fog_type=self.fog_type,
             beta_range=self.beta_range,
             a_range=self.a_range,
             blur_sigma_range=self.blur_sigma_range,
@@ -174,6 +208,7 @@ class RealRGBFolderDataset(Dataset):
         beta_range: Tuple[float, float] = (3.5, 7.0),
         a_range: Tuple[float, float] = (0.85, 1.0),
         blur_sigma_range: Tuple[float, float] = (0.5, 1.8),
+        fog_type: str = "asm",
         fixed_fog: bool = False,
         recursive: bool = False,
     ):
@@ -205,6 +240,7 @@ class RealRGBFolderDataset(Dataset):
         self.beta_range = beta_range
         self.a_range = a_range
         self.blur_sigma_range = blur_sigma_range
+        self.fog_type = fog_type
         self.fixed_fog = fixed_fog
 
     def __len__(self) -> int:
@@ -220,8 +256,9 @@ class RealRGBFolderDataset(Dataset):
         gen = None
         if self.fixed_fog:
             gen = torch.Generator(device=x_clean.device).manual_seed(int(idx))
-        x_hazy = apply_fog(
+        x_hazy = apply_selected_fog(
             x_clean,
+            fog_type=self.fog_type,
             beta_range=self.beta_range,
             a_range=self.a_range,
             blur_sigma_range=self.blur_sigma_range,
@@ -236,6 +273,7 @@ def build_hazy_dataset(
     train: bool,
     img_size: int,
     fog_config: Dict[str, Tuple[float, float]],
+    fog_type: str = "asm",
     fixed_fog: bool = False,
     recursive: bool = False,
 ) -> Dataset:
@@ -248,6 +286,7 @@ def build_hazy_dataset(
             beta_range=fog_config["beta_range"],
             a_range=fog_config["a_range"],
             blur_sigma_range=fog_config["blur_sigma_range"],
+            fog_type=fog_type,
             fixed_fog=fixed_fog,
         )
     if name in ("cifar", "cifar10"):
@@ -259,6 +298,7 @@ def build_hazy_dataset(
             beta_range=fog_config["beta_range"],
             a_range=fog_config["a_range"],
             blur_sigma_range=fog_config["blur_sigma_range"],
+            fog_type=fog_type,
             fixed_fog=fixed_fog,
         )
     if name == "folder":
@@ -269,6 +309,7 @@ def build_hazy_dataset(
             beta_range=fog_config["beta_range"],
             a_range=fog_config["a_range"],
             blur_sigma_range=fog_config["blur_sigma_range"],
+            fog_type=fog_type,
             fixed_fog=fixed_fog,
             recursive=recursive,
         )
@@ -480,6 +521,7 @@ def train(
     num_heads: int = 4,
     model_preset: str = "small",
     fog_preset: Optional[str] = None,
+    fog_type: str = "asm",
     noise_mode: str = "random",
     prediction_mode: str = "direct",
     lambda_l1: float = 0.0,
@@ -543,13 +585,15 @@ def train(
     )
     print(
         "Ablation config: "
-        f"fog={fog_preset}, beta={fog_config['beta_range']}, blur={fog_config['blur_sigma_range']}, "
+        f"fog={fog_preset}, fog_type={fog_type}, beta={fog_config['beta_range']}, "
+        f"blur={fog_config['blur_sigma_range']}, "
         f"noise={noise_mode}, prediction={prediction_mode}, lambda_l1={lambda_l1}, lambda_l2={lambda_l2}"
     )
 
     run_config: Dict[str, Any] = {
         "dataset": name,
         "fog_preset": fog_preset,
+        "fog_type": fog_type,
         "beta_range": fog_config["beta_range"],
         "a_range": fog_config["a_range"],
         "blur_sigma_range": fog_config["blur_sigma_range"],
@@ -576,6 +620,7 @@ def train(
         train=True,
         img_size=img_size,
         fog_config=fog_config,
+        fog_type=fog_type,
         recursive=recursive,
     )
     vis_set = build_hazy_dataset(
@@ -584,6 +629,7 @@ def train(
         train=False,
         img_size=img_size,
         fog_config=fog_config,
+        fog_type=fog_type,
         fixed_fog=True,
         recursive=recursive,
     )
@@ -624,6 +670,7 @@ def train(
                 "dataset": name,
                 "model_preset": model_preset,
                 "fog_preset": fog_preset,
+                "fog_type": fog_type,
                 "beta_range": fog_config["beta_range"],
                 "a_range": fog_config["a_range"],
                 "blur_sigma_range": fog_config["blur_sigma_range"],
@@ -843,6 +890,7 @@ def save_metrics(path: Path, metrics: Dict[str, float], run_config: Dict[str, An
     ordered_keys = [
         "dataset",
         "fog_preset",
+        "fog_type",
         "beta_range",
         "blur_sigma_range",
         "noise_mode",
@@ -887,6 +935,7 @@ def main():
     p.add_argument("--num_heads", type=int, default=4)
     p.add_argument("--fog_preset", choices=["mild", "medium", "heavy"], default=None,
                    help="Default: mild for CIFAR-10, heavy/original for MNIST.")
+    p.add_argument("--fog_type", choices=["asm", "mcbm"], default="asm")
     p.add_argument("--noise_mode", choices=["random", "zero"], default="random")
     p.add_argument("--prediction_mode", choices=["direct", "residual"], default="direct")
     p.add_argument("--lambda_l1", type=float, default=0.0)
@@ -930,6 +979,7 @@ def main():
         num_heads=args.num_heads,
         model_preset=args.model_preset,
         fog_preset=args.fog_preset,
+        fog_type=args.fog_type,
         noise_mode=args.noise_mode,
         prediction_mode=args.prediction_mode,
         lambda_l1=args.lambda_l1,
