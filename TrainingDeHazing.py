@@ -481,13 +481,12 @@ def conditional_drift_loss(
     x_hat: torch.Tensor,
     x_clean: torch.Tensor,
     temperatures: List[float] = (0.05, 0.2, 0.5),
+    positive_mode: str = "batch",
 ) -> torch.Tensor:
     """Per-example "conditional drifting" loss.
 
-    For sample i the only positive is x_clean_i (the matched clean image) and
-    the negatives are the other generated samples in the batch x_hat_{j != i}.
-    Reduces to the same V used by the rest of the codebase, just with a
-    singleton positive set per example.
+    In batch mode every clean image in the batch is treated as a positive.
+    In paired mode sample i uses only x_clean_i as its positive target.
     """
     feat_gen = x_hat.flatten(start_dim=1)
     feat_pos = x_clean.flatten(start_dim=1)
@@ -496,11 +495,36 @@ def conditional_drift_loss(
     feat_pos_norm = F.normalize(feat_pos, p=2, dim=1)
 
     v_total = torch.zeros_like(feat_gen_norm)
-    for tau in temperatures:
-        # Negatives = other generated samples (mask_self=True drops the diagonal).
-        v_tau = compute_V(feat_gen_norm, feat_pos_norm, feat_gen_norm, tau, mask_self=True)
-        v_norm = torch.sqrt(torch.mean(v_tau ** 2) + 1e-8)
-        v_total = v_total + v_tau / (v_norm + 1e-8)
+    if positive_mode == "batch":
+        for tau in temperatures:
+            # Negatives = other generated samples (mask_self=True drops the diagonal).
+            v_tau = compute_V(feat_gen_norm, feat_pos_norm, feat_gen_norm, tau, mask_self=True)
+            v_norm = torch.sqrt(torch.mean(v_tau ** 2) + 1e-8)
+            v_total = v_total + v_tau / (v_norm + 1e-8)
+    elif positive_mode == "paired":
+        batch_size = feat_gen_norm.shape[0]
+        for tau in temperatures:
+            v_tau = torch.zeros_like(feat_gen_norm)
+            for i in range(batch_size):
+                if batch_size > 1:
+                    neg_mask = torch.ones(batch_size, dtype=torch.bool, device=feat_gen_norm.device)
+                    neg_mask[i] = False
+                    y_neg = feat_gen_norm[neg_mask]
+                    mask_self = False
+                else:
+                    y_neg = feat_gen_norm
+                    mask_self = True
+                v_tau[i : i + 1] = compute_V(
+                    feat_gen_norm[i : i + 1],
+                    feat_pos_norm[i : i + 1],
+                    y_neg,
+                    tau,
+                    mask_self=mask_self,
+                )
+            v_norm = torch.sqrt(torch.mean(v_tau ** 2) + 1e-8)
+            v_total = v_total + v_tau / (v_norm + 1e-8)
+    else:
+        raise ValueError(f"Unknown drift positive mode: {positive_mode}")
 
     target = (feat_gen_norm + v_total).detach()
     return F.mse_loss(feat_gen_norm, target)
@@ -525,6 +549,7 @@ def train(
     noise_mode: str = "random",
     prediction_mode: str = "direct",
     loss_mode: str = "drift",
+    drift_positive_mode: str = "batch",
     lambda_l1: float = 0.0,
     lambda_l2: float = 0.0,
     lr: float = 2e-4,
@@ -594,6 +619,7 @@ def train(
         f"fog={fog_preset}, fog_type={fog_type}, beta={fog_config['beta_range']}, "
         f"blur={fog_config['blur_sigma_range']}, "
         f"noise={noise_mode}, prediction={prediction_mode}, loss_mode={loss_mode}, "
+        f"drift_positive_mode={drift_positive_mode}, "
         f"lambda_l1={lambda_l1}, lambda_l2={lambda_l2}"
     )
 
@@ -607,6 +633,7 @@ def train(
         "noise_mode": noise_mode,
         "prediction_mode": prediction_mode,
         "loss_mode": loss_mode,
+        "drift_positive_mode": drift_positive_mode,
         "lambda_l1": lambda_l1,
         "lambda_l2": lambda_l2,
         "model_preset": model_preset,
@@ -685,6 +712,7 @@ def train(
                 "noise_mode": noise_mode,
                 "prediction_mode": prediction_mode,
                 "loss_mode": loss_mode,
+                "drift_positive_mode": drift_positive_mode,
                 "lambda_l1": lambda_l1,
                 "lambda_l2": lambda_l2,
             },
@@ -736,7 +764,11 @@ def train(
                 drift_loss = torch.zeros((), device=device)
                 loss = lambda_l1 * l1_loss + lambda_l2 * l2_loss
             elif loss_mode in ("drift", "mixed"):
-                drift_loss = conditional_drift_loss(x_hat, x_clean)
+                drift_loss = conditional_drift_loss(
+                    x_hat,
+                    x_clean,
+                    positive_mode=drift_positive_mode,
+                )
                 loss = drift_loss + lambda_l1 * l1_loss + lambda_l2 * l2_loss
             else:
                 raise ValueError(f"Unknown loss mode: {loss_mode}")
@@ -880,7 +912,11 @@ def paired_dehaze_metrics(
         drift_loss = 0.0
         total_loss = float(run_config["lambda_l1"]) * l1_loss + float(run_config["lambda_l2"]) * l2_loss
     elif loss_mode in ("drift", "mixed"):
-        drift_loss = conditional_drift_loss(x_hat, x_clean).item()
+        drift_loss = conditional_drift_loss(
+            x_hat,
+            x_clean,
+            positive_mode=str(run_config.get("drift_positive_mode", "batch")),
+        ).item()
         total_loss = (
             drift_loss
             + float(run_config["lambda_l1"]) * l1_loss
@@ -918,6 +954,7 @@ def save_metrics(path: Path, metrics: Dict[str, float], run_config: Dict[str, An
         "noise_mode",
         "prediction_mode",
         "loss_mode",
+        "drift_positive_mode",
         "lambda_l1",
         "lambda_l2",
         "model_preset",
@@ -962,6 +999,7 @@ def main():
     p.add_argument("--noise_mode", choices=["random", "zero"], default="random")
     p.add_argument("--prediction_mode", choices=["direct", "residual"], default="direct")
     p.add_argument("--loss_mode", choices=["drift", "supervised", "mixed"], default="drift")
+    p.add_argument("--drift_positive_mode", choices=["batch", "paired"], default="batch")
     p.add_argument("--lambda_l1", type=float, default=0.0)
     p.add_argument("--lambda_l2", type=float, default=0.0)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -1007,6 +1045,7 @@ def main():
         noise_mode=args.noise_mode,
         prediction_mode=args.prediction_mode,
         loss_mode=args.loss_mode,
+        drift_positive_mode=args.drift_positive_mode,
         lambda_l1=args.lambda_l1,
         lambda_l2=args.lambda_l2,
         lr=args.lr,
