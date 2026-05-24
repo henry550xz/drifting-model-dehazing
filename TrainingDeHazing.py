@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 
@@ -323,6 +324,75 @@ class HazyCIFAR10(Dataset):
         return x_clean.squeeze(0), x_hazy.squeeze(0), int(label)
 
 
+class RealRGBFolderDataset(Dataset):
+    """RGB image folder wrapped with on-the-fly fog. Returns (x_clean, x_hazy, -1)."""
+
+    IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+    def __init__(
+        self,
+        root: str,
+        train: bool = True,
+        img_size: int = 128,
+        beta_range: Tuple[float, float] = (3.5, 7.0),
+        a_range: Tuple[float, float] = (0.85, 1.0),
+        blur_sigma_range: Tuple[float, float] = (0.5, 1.8),
+        fixed_fog: bool = False,
+        recursive: bool = False,
+    ):
+        self.root = Path(root)
+        self.img_size = img_size
+        if not self.root.exists():
+            raise FileNotFoundError(f"Image folder does not exist: {self.root}")
+        iterator = self.root.rglob("*") if recursive else self.root.iterdir()
+        self.paths = sorted(
+            path
+            for path in iterator
+            if path.is_file() and path.suffix.lower() in self.IMG_EXTENSIONS
+        )
+        if not self.paths:
+            mode = "recursively" if recursive else "non-recursively"
+            extensions = ", ".join(sorted(self.IMG_EXTENSIONS))
+            raise ValueError(
+                f"No supported images found {mode} in {self.root}. "
+                f"Supported extensions: {extensions}"
+            )
+
+        crop = transforms.RandomCrop(img_size) if train else transforms.CenterCrop(img_size)
+        self.transform = transforms.Compose([
+            transforms.Resize(img_size),
+            crop,
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # -> [-1, 1]
+        ])
+        self.beta_range = beta_range
+        self.a_range = a_range
+        self.blur_sigma_range = blur_sigma_range
+        self.fixed_fog = fixed_fog
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, idx: int):
+        with Image.open(self.paths[idx]) as image:
+            x_clean = self.transform(image.convert("RGB"))
+        expected_shape = (3, self.img_size, self.img_size)
+        if tuple(x_clean.shape) != expected_shape:
+            raise ValueError(f"Folder sample should be {expected_shape}, got {tuple(x_clean.shape)}")
+        x_clean = x_clean.unsqueeze(0)
+        gen = None
+        if self.fixed_fog:
+            gen = torch.Generator(device=x_clean.device).manual_seed(int(idx))
+        x_hazy = apply_fog(
+            x_clean,
+            beta_range=self.beta_range,
+            a_range=self.a_range,
+            blur_sigma_range=self.blur_sigma_range,
+            generator=gen,
+        )
+        return x_clean.squeeze(0), x_hazy.squeeze(0), -1
+
+
 def build_hazy_dataset(
     dataset: str,
     data_dir: str,
@@ -330,6 +400,7 @@ def build_hazy_dataset(
     img_size: int,
     fog_config: Dict[str, Tuple[float, float]],
     fixed_fog: bool = False,
+    recursive: bool = False,
 ) -> Dataset:
     name = dataset.lower()
     if name == "mnist":
@@ -353,6 +424,17 @@ def build_hazy_dataset(
             blur_sigma_range=fog_config["blur_sigma_range"],
             fixed_fog=fixed_fog,
         )
+    if name == "folder":
+        return RealRGBFolderDataset(
+            root=data_dir,
+            train=train,
+            img_size=img_size,
+            beta_range=fog_config["beta_range"],
+            a_range=fog_config["a_range"],
+            blur_sigma_range=fog_config["blur_sigma_range"],
+            fixed_fog=fixed_fog,
+            recursive=recursive,
+        )
     raise ValueError(f"Unknown dataset: {dataset}")
 
 
@@ -360,7 +442,7 @@ def dataset_channels(dataset: str) -> int:
     name = dataset.lower()
     if name == "mnist":
         return 1
-    if name in ("cifar", "cifar10"):
+    if name in ("cifar", "cifar10", "folder"):
         return 3
     raise ValueError(f"Unknown dataset: {dataset}")
 
@@ -580,6 +662,7 @@ def train(
     seed: int = 42,
     smoke_test: bool = False,
     max_steps: Optional[int] = None,
+    recursive: bool = False,
 ):
     """End-to-end training loop."""
     set_seed(seed)
@@ -650,7 +733,14 @@ def train(
     # In smoke-test mode, log every step so the user sees activity quickly.
     effective_log_interval = 5 if smoke_test else log_interval
 
-    train_set = build_hazy_dataset(name, data_dir, train=True, img_size=img_size, fog_config=fog_config)
+    train_set = build_hazy_dataset(
+        name,
+        data_dir,
+        train=True,
+        img_size=img_size,
+        fog_config=fog_config,
+        recursive=recursive,
+    )
     vis_set = build_hazy_dataset(
         name,
         data_dir,
@@ -658,6 +748,7 @@ def train(
         img_size=img_size,
         fog_config=fog_config,
         fixed_fog=True,
+        recursive=recursive,
     )
     train_loader = DataLoader(
         train_set,
@@ -949,7 +1040,7 @@ def save_metrics(path: Path, metrics: Dict[str, float], run_config: Dict[str, An
 
 def main():
     p = argparse.ArgumentParser(description="Synthetic MNIST/CIFAR-10 dehazing toy example.")
-    p.add_argument("--dataset", choices=["mnist", "cifar10"], default="mnist")
+    p.add_argument("--dataset", choices=["mnist", "cifar10", "folder"], default="mnist")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--img_size", type=int, default=None)
@@ -969,6 +1060,8 @@ def main():
     p.add_argument("--save_dir", "--output_dir", dest="output_dir", type=str, default=None)
     p.add_argument("--device", type=str, default="auto", help="auto, cpu, cuda, cuda:0, or mps")
     p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--recursive", action="store_true",
+                   help="Recursively scan image files when --dataset folder.")
     p.add_argument("--log_interval", type=int, default=100)
     p.add_argument("--sample_interval", type=int, default=400,
                    help="Optional step interval for extra samples (0 = only save per epoch).")
@@ -1016,6 +1109,7 @@ def main():
         seed=args.seed,
         smoke_test=args.smoke_test,
         max_steps=args.max_steps,
+        recursive=args.recursive,
     )
 
 
