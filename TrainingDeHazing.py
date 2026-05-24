@@ -19,6 +19,7 @@ from drifting import compute_V
 from haze.asm import apply_fog, make_flat_depth_map, resolve_fog_config
 from haze.mcbm import apply_mcbm_fog
 from model import DiTBlock, FinalLayer, PatchEmbed, RotaryPositionEmbedding
+from unet import UNetDehazer
 from utils import EMA, WarmupLRScheduler, count_parameters, save_image_grid, set_seed
 
 """
@@ -654,6 +655,34 @@ class DehazingDiT(nn.Module):
         return self.unpatchify(x)
 
 
+def build_dehazing_model(
+    model_type: str,
+    img_size: int,
+    in_channels: int,
+    hidden_size: int,
+    depth: int,
+    num_heads: int,
+    unet_base_channels: int,
+    unet_depth: int,
+) -> nn.Module:
+    if model_type == "dit":
+        return DehazingDiT(
+            img_size=img_size,
+            in_channels=in_channels,
+            hidden_size=hidden_size,
+            depth=depth,
+            num_heads=num_heads,
+        )
+    if model_type == "unet":
+        return UNetDehazer(
+            in_channels=2 * in_channels,
+            out_channels=in_channels,
+            base_channels=unet_base_channels,
+            depth=unet_depth,
+        )
+    raise ValueError(f"Unknown model type: {model_type}")
+
+
 # ---------------------------------------------------------------------------
 # 3. Losses
 # ---------------------------------------------------------------------------
@@ -727,6 +756,9 @@ def train(
     depth: int = 6,
     num_heads: int = 4,
     model_preset: str = "small",
+    model_type: str = "dit",
+    unet_base_channels: int = 32,
+    unet_depth: int = 3,
     fog_preset: Optional[str] = None,
     fog_type: str = "asm",
     depth_mode: str = "synthetic",
@@ -761,6 +793,8 @@ def train(
     set_seed(seed)
     name = dataset.lower()
     in_channels = dataset_channels(name)
+    if model_type not in ("dit", "unet"):
+        raise ValueError(f"Unknown model type: {model_type}")
     if name in ("cifar", "cifar10"):
         img_size = 32
     if depth_mode == "external":
@@ -803,10 +837,17 @@ def train(
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     print(f"Dataset: {dataset} | image size: {img_size} | channels: {in_channels}")
     print(f"Device: {device}")
-    print(
-        "Model config: "
-        f"preset={model_preset}, hidden_size={hidden_size}, depth={depth}, num_heads={num_heads}"
-    )
+    if model_type == "dit":
+        print(
+            "Model config: "
+            f"preset={model_preset}, hidden_size={hidden_size}, depth={depth}, num_heads={num_heads}"
+        )
+    else:
+        print(
+            "Model config: "
+            f"type=unet, input_channels={2 * in_channels}, output_channels={in_channels}, "
+            f"base_channels={unet_base_channels}, depth={unet_depth}"
+        )
     print(
         "Ablation config: "
         f"fog={fog_preset}, fog_type={fog_type}, beta={fog_config['beta_range']}, "
@@ -831,10 +872,13 @@ def train(
         "drift_positive_mode": drift_positive_mode,
         "lambda_l1": lambda_l1,
         "lambda_l2": lambda_l2,
+        "model_type": model_type,
         "model_preset": model_preset,
         "hidden_size": hidden_size,
         "depth": depth,
         "num_heads": num_heads,
+        "unet_base_channels": unet_base_channels,
+        "unet_depth": unet_depth,
         "batch_size": batch_size,
         "epochs": epochs,
         "img_size": img_size,
@@ -892,14 +936,17 @@ def train(
         drop_last=True,
     )
 
-    model = DehazingDiT(
+    model = build_dehazing_model(
+        model_type=model_type,
         img_size=img_size,
         in_channels=in_channels,
         hidden_size=hidden_size,
         depth=depth,
         num_heads=num_heads,
+        unet_base_channels=unet_base_channels,
+        unet_depth=unet_depth,
     ).to(device)
-    print(f"DehazingDiT params: {count_parameters(model):,}")
+    print(f"{model.__class__.__name__} params: {count_parameters(model):,}")
 
     ema = EMA(model, decay=ema_decay)
     optimizer = torch.optim.AdamW(
@@ -918,7 +965,10 @@ def train(
                 "num_heads": num_heads,
                 "in_channels": in_channels,
                 "dataset": name,
+                "model_type": model_type,
                 "model_preset": model_preset,
+                "unet_base_channels": unet_base_channels,
+                "unet_depth": unet_depth,
                 "fog_preset": fog_preset,
                 "fog_type": fog_type,
                 "depth_mode": depth_mode,
@@ -1308,10 +1358,13 @@ def save_metrics(path: Path, metrics: Dict[str, float], run_config: Dict[str, An
         "drift_positive_mode",
         "lambda_l1",
         "lambda_l2",
+        "model_type",
         "model_preset",
         "hidden_size",
         "depth",
         "num_heads",
+        "unet_base_channels",
+        "unet_depth",
         "batch_size",
         "epochs",
     ]
@@ -1341,9 +1394,12 @@ def main():
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--img_size", type=int, default=None)
     p.add_argument("--model_preset", choices=["small", "medium", "large", "custom"], default="small")
+    p.add_argument("--model_type", choices=["dit", "unet"], default="dit")
     p.add_argument("--hidden_size", type=int, default=192)
     p.add_argument("--depth", type=int, default=6)
     p.add_argument("--num_heads", type=int, default=4)
+    p.add_argument("--unet_base_channels", type=int, default=32)
+    p.add_argument("--unet_depth", type=int, default=3)
     p.add_argument("--fog_preset", choices=["mild", "medium", "heavy"], default=None,
                    help="Default: mild for CIFAR-10, heavy/original for MNIST.")
     p.add_argument("--fog_type", choices=["asm", "mcbm"], default="asm")
@@ -1400,6 +1456,9 @@ def main():
         depth=args.depth,
         num_heads=args.num_heads,
         model_preset=args.model_preset,
+        model_type=args.model_type,
+        unet_base_channels=args.unet_base_channels,
+        unet_depth=args.unet_depth,
         fog_preset=args.fog_preset,
         fog_type=args.fog_type,
         depth_mode=args.depth_mode,

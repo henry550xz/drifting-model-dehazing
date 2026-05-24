@@ -8,6 +8,7 @@ The training entry point for this dehazing work is `TrainingDeHazing.py`.
 
 - MNIST and CIFAR-10 synthetic dehazing.
 - Real RGB image folders with `--dataset folder`.
+- DiT and U-Net model options with `--model_type {dit,unet}`.
 - ASM fog and MCBM fog with `--fog_type {asm,mcbm}`.
 - Synthetic, flat, and external depth maps with `--depth_mode {synthetic,flat,external}`.
 - Drift, supervised, and mixed training losses with `--loss_mode {drift,supervised,mixed}`.
@@ -46,6 +47,28 @@ This runs one CPU step and writes outputs under `/tmp`.
   --epochs 1 \
   --max_steps 1 \
   --save_dir /tmp/dehaze_smoke_cifar \
+  --device cpu \
+  --num_workers 0
+```
+
+### U-Net CIFAR Smoke Test
+
+This uses the same dehazing pipeline with a small U-Net restoration baseline.
+
+```bash
+.venv/bin/python TrainingDeHazing.py \
+  --dataset cifar10 \
+  --model_type unet \
+  --unet_base_channels 16 \
+  --unet_depth 2 \
+  --fog_type asm \
+  --depth_mode synthetic \
+  --loss_mode supervised \
+  --lambda_l1 1.0 \
+  --batch_size 2 \
+  --epochs 1 \
+  --max_steps 1 \
+  --save_dir /tmp/dehaze_smoke_unet \
   --device cpu \
   --num_workers 0
 ```
@@ -144,6 +167,9 @@ External depth is currently supported for `--dataset folder` only.
 - `--data_dir PATH`: dataset root. For folder mode this is the clean RGB image folder.
 - `--recursive`: recursively scan `--data_dir` for folder images.
 - `--img_size N`: output crop size for MNIST and folder datasets. CIFAR-10 uses fixed `32`.
+- `--model_type {dit,unet}`: selects the default DiT generator or a simple U-Net restoration baseline.
+- `--unet_base_channels N`: base U-Net channel count when `--model_type unet`.
+- `--unet_depth N`: number of U-Net encoder/decoder levels when `--model_type unet`.
 - `--fog_type {asm,mcbm}`: selects atmospheric scattering model fog or MCBM non-homogeneous fog.
 - `--fog_preset {mild,medium,heavy}`: selects fog strength ranges. Defaults are dataset-aware.
 - `--depth_mode {synthetic,flat,external}`: selects the depth source for fog generation.
@@ -231,7 +257,7 @@ checkpoints/
 
 Epoch checkpoints and samples are named `epoch_XXX.pt` and `epoch_XXX.png` when `--epoch_save_interval` enables them. CIFAR runs also write compatibility files such as `cifar_dehaze_samples.png` and `cifar_dehaze_samples.txt`.
 
-Sample text files include paired hazy/dehazed metrics for the synthetic pair created by the dataset. Checkpoints include the model, EMA state, and run configuration, including `depth_mode` and `depth_dir`.
+Sample text files include paired hazy/dehazed metrics for the synthetic pair created by the dataset. Checkpoints include the model, EMA state, and run configuration, including `model_type`, `depth_mode`, and `depth_dir`.
 
 When `--save_fog_debug` is enabled, fog debug output includes:
 
