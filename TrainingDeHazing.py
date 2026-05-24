@@ -524,6 +524,7 @@ def train(
     fog_type: str = "asm",
     noise_mode: str = "random",
     prediction_mode: str = "direct",
+    loss_mode: str = "drift",
     lambda_l1: float = 0.0,
     lambda_l2: float = 0.0,
     lr: float = 2e-4,
@@ -549,6 +550,11 @@ def train(
     in_channels = dataset_channels(name)
     if name in ("cifar", "cifar10"):
         img_size = 32
+    if loss_mode == "supervised" and lambda_l1 == 0.0 and lambda_l2 == 0.0:
+        raise ValueError(
+            "loss_mode=supervised requires at least one supervised weight; "
+            "set --lambda_l1 or --lambda_l2."
+        )
     fog_preset, fog_config = resolve_fog_config(name, fog_preset)
     hidden_size, depth, num_heads = resolve_model_config(
         model_preset, hidden_size, depth, num_heads
@@ -587,7 +593,8 @@ def train(
         "Ablation config: "
         f"fog={fog_preset}, fog_type={fog_type}, beta={fog_config['beta_range']}, "
         f"blur={fog_config['blur_sigma_range']}, "
-        f"noise={noise_mode}, prediction={prediction_mode}, lambda_l1={lambda_l1}, lambda_l2={lambda_l2}"
+        f"noise={noise_mode}, prediction={prediction_mode}, loss_mode={loss_mode}, "
+        f"lambda_l1={lambda_l1}, lambda_l2={lambda_l2}"
     )
 
     run_config: Dict[str, Any] = {
@@ -599,6 +606,7 @@ def train(
         "blur_sigma_range": fog_config["blur_sigma_range"],
         "noise_mode": noise_mode,
         "prediction_mode": prediction_mode,
+        "loss_mode": loss_mode,
         "lambda_l1": lambda_l1,
         "lambda_l2": lambda_l2,
         "model_preset": model_preset,
@@ -676,6 +684,7 @@ def train(
                 "blur_sigma_range": fog_config["blur_sigma_range"],
                 "noise_mode": noise_mode,
                 "prediction_mode": prediction_mode,
+                "loss_mode": loss_mode,
                 "lambda_l1": lambda_l1,
                 "lambda_l2": lambda_l2,
             },
@@ -721,10 +730,16 @@ def train(
             if x_hat.shape != x_clean.shape:
                 raise RuntimeError(f"Dehazed output shape {tuple(x_hat.shape)} != clean {tuple(x_clean.shape)}")
 
-            drift_loss = conditional_drift_loss(x_hat, x_clean)
             l1_loss = F.l1_loss(x_hat, x_clean)
             l2_loss = F.mse_loss(x_hat, x_clean)
-            loss = drift_loss + lambda_l1 * l1_loss + lambda_l2 * l2_loss
+            if loss_mode == "supervised":
+                drift_loss = torch.zeros((), device=device)
+                loss = lambda_l1 * l1_loss + lambda_l2 * l2_loss
+            elif loss_mode in ("drift", "mixed"):
+                drift_loss = conditional_drift_loss(x_hat, x_clean)
+                loss = drift_loss + lambda_l1 * l1_loss + lambda_l2 * l2_loss
+            else:
+                raise ValueError(f"Unknown loss mode: {loss_mode}")
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -858,14 +873,21 @@ def paired_dehaze_metrics(
     """Simple paired synthetic metrics on [-1, 1] tensors."""
     mse_hazy, psnr_hazy = _mse_psnr(x_hazy, x_clean)
     mse_dehazed, psnr_dehazed = _mse_psnr(x_hat, x_clean)
-    drift_loss = conditional_drift_loss(x_hat, x_clean).item()
     l1_loss = F.l1_loss(x_hat, x_clean).item()
     l2_loss = F.mse_loss(x_hat, x_clean).item()
-    total_loss = (
-        drift_loss
-        + float(run_config["lambda_l1"]) * l1_loss
-        + float(run_config["lambda_l2"]) * l2_loss
-    )
+    loss_mode = str(run_config.get("loss_mode", "drift"))
+    if loss_mode == "supervised":
+        drift_loss = 0.0
+        total_loss = float(run_config["lambda_l1"]) * l1_loss + float(run_config["lambda_l2"]) * l2_loss
+    elif loss_mode in ("drift", "mixed"):
+        drift_loss = conditional_drift_loss(x_hat, x_clean).item()
+        total_loss = (
+            drift_loss
+            + float(run_config["lambda_l1"]) * l1_loss
+            + float(run_config["lambda_l2"]) * l2_loss
+        )
+    else:
+        raise ValueError(f"Unknown loss mode: {loss_mode}")
     return {
         "mse_hazy": mse_hazy,
         "psnr_hazy": psnr_hazy,
@@ -895,6 +917,7 @@ def save_metrics(path: Path, metrics: Dict[str, float], run_config: Dict[str, An
         "blur_sigma_range",
         "noise_mode",
         "prediction_mode",
+        "loss_mode",
         "lambda_l1",
         "lambda_l2",
         "model_preset",
@@ -938,6 +961,7 @@ def main():
     p.add_argument("--fog_type", choices=["asm", "mcbm"], default="asm")
     p.add_argument("--noise_mode", choices=["random", "zero"], default="random")
     p.add_argument("--prediction_mode", choices=["direct", "residual"], default="direct")
+    p.add_argument("--loss_mode", choices=["drift", "supervised", "mixed"], default="drift")
     p.add_argument("--lambda_l1", type=float, default=0.0)
     p.add_argument("--lambda_l2", type=float, default=0.0)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -982,6 +1006,7 @@ def main():
         fog_type=args.fog_type,
         noise_mode=args.noise_mode,
         prediction_mode=args.prediction_mode,
+        loss_mode=args.loss_mode,
         lambda_l1=args.lambda_l1,
         lambda_l2=args.lambda_l2,
         lr=args.lr,
