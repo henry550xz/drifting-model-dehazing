@@ -4,7 +4,7 @@ import math
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -15,9 +15,14 @@ from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
-from drifting import compute_V
 from haze.asm import apply_fog, make_flat_depth_map, resolve_fog_config
 from haze.mcbm import apply_mcbm_fog
+from losses import (
+    ModelEncodeFeatureExtractor,
+    compute_drift_loss,
+    conditional_drift_loss,
+    make_multiscale_feature_encoder,
+)
 from model import DiTBlock, FinalLayer, PatchEmbed, RotaryPositionEmbedding
 from unet import UNetDehazer
 from utils import EMA, WarmupLRScheduler, count_parameters, save_image_grid, set_seed
@@ -688,58 +693,31 @@ def build_dehazing_model(
 # ---------------------------------------------------------------------------
 
 
+def build_drift_feature_extractor(
+    drift_space: str,
+    feature_encoder: str,
+    model: nn.Module,
+    in_channels: int,
+    device: torch.device,
+    freeze_feature_encoder: bool,
+) -> Tuple[Optional[nn.Module], bool]:
+    if drift_space == "pixel":
+        return None, False
+    if drift_space != "feature":
+        raise ValueError(f"Unknown drift space: {drift_space}")
 
-def conditional_drift_loss(
-    x_hat: torch.Tensor,
-    x_clean: torch.Tensor,
-    temperatures: List[float] = (0.05, 0.2, 0.5),
-    positive_mode: str = "batch",
-) -> torch.Tensor:
-    """Per-example "conditional drifting" loss.
+    if feature_encoder == "multiscale":
+        extractor = make_multiscale_feature_encoder(in_channels).to(device)
+        if freeze_feature_encoder:
+            for param in extractor.parameters():
+                param.requires_grad_(False)
+            extractor.eval()
+        return extractor, True
 
-    In batch mode every clean image in the batch is treated as a positive.
-    In paired mode sample i uses only x_clean_i as its positive target.
-    """
-    feat_gen = x_hat.flatten(start_dim=1)
-    feat_pos = x_clean.flatten(start_dim=1)
+    if feature_encoder == "none":
+        return ModelEncodeFeatureExtractor(model), False
 
-    feat_gen_norm = F.normalize(feat_gen, p=2, dim=1)
-    feat_pos_norm = F.normalize(feat_pos, p=2, dim=1)
-
-    v_total = torch.zeros_like(feat_gen_norm)
-    if positive_mode == "batch":
-        for tau in temperatures:
-            # Negatives = other generated samples (mask_self=True drops the diagonal).
-            v_tau = compute_V(feat_gen_norm, feat_pos_norm, feat_gen_norm, tau, mask_self=True)
-            v_norm = torch.sqrt(torch.mean(v_tau ** 2) + 1e-8)
-            v_total = v_total + v_tau / (v_norm + 1e-8)
-    elif positive_mode == "paired":
-        batch_size = feat_gen_norm.shape[0]
-        for tau in temperatures:
-            v_tau = torch.zeros_like(feat_gen_norm)
-            for i in range(batch_size):
-                if batch_size > 1:
-                    neg_mask = torch.ones(batch_size, dtype=torch.bool, device=feat_gen_norm.device)
-                    neg_mask[i] = False
-                    y_neg = feat_gen_norm[neg_mask]
-                    mask_self = False
-                else:
-                    y_neg = feat_gen_norm
-                    mask_self = True
-                v_tau[i : i + 1] = compute_V(
-                    feat_gen_norm[i : i + 1],
-                    feat_pos_norm[i : i + 1],
-                    y_neg,
-                    tau,
-                    mask_self=mask_self,
-                )
-            v_norm = torch.sqrt(torch.mean(v_tau ** 2) + 1e-8)
-            v_total = v_total + v_tau / (v_norm + 1e-8)
-    else:
-        raise ValueError(f"Unknown drift positive mode: {positive_mode}")
-
-    target = (feat_gen_norm + v_total).detach()
-    return F.mse_loss(feat_gen_norm, target)
+    raise ValueError(f"Unknown feature encoder: {feature_encoder}")
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +745,9 @@ def train(
     prediction_mode: str = "direct",
     loss_mode: str = "drift",
     drift_positive_mode: str = "batch",
+    drift_space: str = "pixel",
+    feature_encoder: str = "none",
+    freeze_feature_encoder: bool = False,
     lambda_l1: float = 0.0,
     lambda_l2: float = 0.0,
     lr: float = 2e-4,
@@ -795,6 +776,10 @@ def train(
     in_channels = dataset_channels(name)
     if model_type not in ("dit", "unet"):
         raise ValueError(f"Unknown model type: {model_type}")
+    if drift_space not in ("pixel", "feature"):
+        raise ValueError(f"Unknown drift space: {drift_space}")
+    if feature_encoder not in ("none", "multiscale"):
+        raise ValueError(f"Unknown feature encoder: {feature_encoder}")
     if name in ("cifar", "cifar10"):
         img_size = 32
     if depth_mode == "external":
@@ -853,7 +838,8 @@ def train(
         f"fog={fog_preset}, fog_type={fog_type}, beta={fog_config['beta_range']}, "
         f"blur={fog_config['blur_sigma_range']}, depth_mode={depth_mode}, "
         f"noise={noise_mode}, prediction={prediction_mode}, loss_mode={loss_mode}, "
-        f"drift_positive_mode={drift_positive_mode}, "
+        f"drift_space={drift_space}, drift_positive_mode={drift_positive_mode}, "
+        f"feature_encoder={feature_encoder}, freeze_feature_encoder={freeze_feature_encoder}, "
         f"lambda_l1={lambda_l1}, lambda_l2={lambda_l2}"
     )
 
@@ -869,7 +855,10 @@ def train(
         "noise_mode": noise_mode,
         "prediction_mode": prediction_mode,
         "loss_mode": loss_mode,
+        "drift_space": drift_space,
         "drift_positive_mode": drift_positive_mode,
+        "feature_encoder": feature_encoder,
+        "freeze_feature_encoder": freeze_feature_encoder,
         "lambda_l1": lambda_l1,
         "lambda_l2": lambda_l2,
         "model_type": model_type,
@@ -948,14 +937,37 @@ def train(
     ).to(device)
     print(f"{model.__class__.__name__} params: {count_parameters(model):,}")
 
+    drift_feature_extractor, has_external_feature_encoder = build_drift_feature_extractor(
+        drift_space=drift_space,
+        feature_encoder=feature_encoder,
+        model=model,
+        in_channels=in_channels,
+        device=device,
+        freeze_feature_encoder=freeze_feature_encoder,
+    )
+    train_feature_encoder = (
+        drift_feature_extractor is not None
+        and has_external_feature_encoder
+        and not freeze_feature_encoder
+    )
+    if drift_feature_extractor is not None:
+        print(
+            "Drift feature extractor: "
+            f"{drift_feature_extractor.__class__.__name__} "
+            f"(trainable={train_feature_encoder})"
+        )
+
     ema = EMA(model, decay=ema_decay)
+    optimizer_params = list(model.parameters())
+    if train_feature_encoder:
+        optimizer_params.extend(drift_feature_extractor.parameters())
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=weight_decay
+        optimizer_params, lr=lr, betas=(0.9, 0.95), weight_decay=weight_decay
     )
     scheduler = WarmupLRScheduler(optimizer, warmup_steps=warmup_steps, base_lr=lr)
 
     def checkpoint_payload():
-        return {
+        payload = {
             "model": model.state_dict(),
             "ema": ema.state_dict(),
             "config": {
@@ -979,7 +991,10 @@ def train(
                 "noise_mode": noise_mode,
                 "prediction_mode": prediction_mode,
                 "loss_mode": loss_mode,
+                "drift_space": drift_space,
                 "drift_positive_mode": drift_positive_mode,
+                "feature_encoder": feature_encoder,
+                "freeze_feature_encoder": freeze_feature_encoder,
                 "lambda_l1": lambda_l1,
                 "lambda_l2": lambda_l2,
                 "save_fog_debug": save_fog_debug,
@@ -987,6 +1002,9 @@ def train(
                 "fog_debug_max_images": fog_debug_max_images,
             },
         }
+        if has_external_feature_encoder and drift_feature_extractor is not None:
+            payload["feature_encoder_state"] = drift_feature_extractor.state_dict()
+        return payload
 
     def save_random_triple_grid(path: Path, n: int = 16) -> Dict[str, float]:
         indices = torch.randint(len(vis_set), (n,))
@@ -1001,6 +1019,7 @@ def train(
             noise_mode=noise_mode,
             prediction_mode=prediction_mode,
             run_config=run_config,
+            feature_extractor=drift_feature_extractor,
         )
 
     global_step = 0
@@ -1034,10 +1053,12 @@ def train(
                 drift_loss = torch.zeros((), device=device)
                 loss = lambda_l1 * l1_loss + lambda_l2 * l2_loss
             elif loss_mode in ("drift", "mixed"):
-                drift_loss = conditional_drift_loss(
+                drift_loss = compute_drift_loss(
                     x_hat,
                     x_clean,
+                    drift_space=drift_space,
                     positive_mode=drift_positive_mode,
+                    feature_extractor=drift_feature_extractor,
                 )
                 loss = drift_loss + lambda_l1 * l1_loss + lambda_l2 * l2_loss
             else:
@@ -1261,10 +1282,14 @@ def save_triple_grid(
     noise_mode: str,
     prediction_mode: str,
     run_config: Dict[str, Any],
+    feature_extractor: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Save a grid with rows of [clean | hazy | dehazed]."""
     was_training = model.training
+    feature_was_training = feature_extractor.training if feature_extractor is not None else False
     model.eval()
+    if feature_extractor is not None:
+        feature_extractor.eval()
     if x_clean.shape != x_hazy.shape:
         raise RuntimeError(f"Clean shape {tuple(x_clean.shape)} != hazy {tuple(x_hazy.shape)}")
     z = make_noise(x_clean, noise_mode)
@@ -1276,7 +1301,13 @@ def save_triple_grid(
     x_hat = apply_prediction_mode(raw_output, x_hazy, prediction_mode)
     if x_hat.shape != x_clean.shape:
         raise RuntimeError(f"Dehazed output shape {tuple(x_hat.shape)} != clean {tuple(x_clean.shape)}")
-    metrics = paired_dehaze_metrics(x_hat, x_hazy, x_clean, run_config)
+    metrics = paired_dehaze_metrics(
+        x_hat,
+        x_hazy,
+        x_clean,
+        run_config,
+        feature_extractor=feature_extractor,
+    )
 
     # Interleave: clean_i, hazy_i, dehazed_i, clean_{i+1}, hazy_{i+1}, ...
     n = x_clean.shape[0]
@@ -1286,6 +1317,8 @@ def save_triple_grid(
     save_metrics(path.with_suffix(".txt"), metrics, run_config)
     if was_training:
         model.train()
+    if feature_extractor is not None and feature_was_training:
+        feature_extractor.train()
     return metrics
 
 
@@ -1300,6 +1333,7 @@ def paired_dehaze_metrics(
     x_hazy: torch.Tensor,
     x_clean: torch.Tensor,
     run_config: Dict[str, Any],
+    feature_extractor: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Simple paired synthetic metrics on [-1, 1] tensors."""
     mse_hazy, psnr_hazy = _mse_psnr(x_hazy, x_clean)
@@ -1311,10 +1345,12 @@ def paired_dehaze_metrics(
         drift_loss = 0.0
         total_loss = float(run_config["lambda_l1"]) * l1_loss + float(run_config["lambda_l2"]) * l2_loss
     elif loss_mode in ("drift", "mixed"):
-        drift_loss = conditional_drift_loss(
+        drift_loss = compute_drift_loss(
             x_hat,
             x_clean,
+            drift_space=str(run_config.get("drift_space", "pixel")),
             positive_mode=str(run_config.get("drift_positive_mode", "batch")),
+            feature_extractor=feature_extractor,
         ).item()
         total_loss = (
             drift_loss
@@ -1355,7 +1391,10 @@ def save_metrics(path: Path, metrics: Dict[str, float], run_config: Dict[str, An
         "noise_mode",
         "prediction_mode",
         "loss_mode",
+        "drift_space",
         "drift_positive_mode",
+        "feature_encoder",
+        "freeze_feature_encoder",
         "lambda_l1",
         "lambda_l2",
         "model_type",
@@ -1409,7 +1448,10 @@ def main():
     p.add_argument("--noise_mode", choices=["random", "zero"], default="random")
     p.add_argument("--prediction_mode", choices=["direct", "residual"], default="direct")
     p.add_argument("--loss_mode", choices=["drift", "supervised", "mixed"], default="drift")
+    p.add_argument("--drift_space", "--drift_loss", dest="drift_space", choices=["pixel", "feature"], default="pixel")
     p.add_argument("--drift_positive_mode", choices=["batch", "paired"], default="batch")
+    p.add_argument("--feature_encoder", choices=["multiscale", "none"], default="none")
+    p.add_argument("--freeze_feature_encoder", action="store_true")
     p.add_argument("--lambda_l1", type=float, default=0.0)
     p.add_argument("--lambda_l2", type=float, default=0.0)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -1466,7 +1508,10 @@ def main():
         noise_mode=args.noise_mode,
         prediction_mode=args.prediction_mode,
         loss_mode=args.loss_mode,
+        drift_space=args.drift_space,
         drift_positive_mode=args.drift_positive_mode,
+        feature_encoder=args.feature_encoder,
+        freeze_feature_encoder=args.freeze_feature_encoder,
         lambda_l1=args.lambda_l1,
         lambda_l2=args.lambda_l2,
         lr=args.lr,
