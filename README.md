@@ -272,6 +272,22 @@ metadata_summary.json
 
 `density_grid.png` is present when the selected fog type exposes a density map, such as MCBM.
 
+## Restoration Evaluation
+
+Use `eval_restoration.py` to evaluate existing clean/dehazed prediction folders. This first version does not load checkpoints or run model inference.
+
+```bash
+.venv/bin/python eval_restoration.py \
+  --clean_dir ./data/clean \
+  --pred_dir ./outputs/predictions \
+  --hazy_dir ./data/hazy \
+  --output ./outputs/restoration_metrics.json \
+  --match_mode relative \
+  --recursive
+```
+
+The script reports MSE, MAE, and PSNR for clean vs. prediction pairs. When `--hazy_dir` is provided, it also reports the same hazy baseline metrics and mean improvement fields.
+
 ## Development Notes
 
 - Use `/tmp/...` for smoke-test outputs while developing.
