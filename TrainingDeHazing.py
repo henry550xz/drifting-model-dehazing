@@ -20,7 +20,6 @@ from haze.mcbm import apply_mcbm_fog
 from losses import (
     ModelEncodeFeatureExtractor,
     compute_drift_loss,
-    conditional_drift_loss,
     make_multiscale_feature_encoder,
 )
 from model import DiTBlock, FinalLayer, PatchEmbed, RotaryPositionEmbedding
@@ -747,7 +746,7 @@ def train(
     drift_positive_mode: str = "batch",
     drift_space: str = "pixel",
     feature_encoder: str = "none",
-    freeze_feature_encoder: bool = False,
+    freeze_feature_encoder: bool = True,
     lambda_l1: float = 0.0,
     lambda_l2: float = 0.0,
     lr: float = 2e-4,
@@ -780,6 +779,12 @@ def train(
         raise ValueError(f"Unknown drift space: {drift_space}")
     if feature_encoder not in ("none", "multiscale"):
         raise ValueError(f"Unknown feature encoder: {feature_encoder}")
+    uses_drift_loss = loss_mode in ("drift", "mixed")
+    effective_drift_space = drift_space if uses_drift_loss else "pixel"
+    effective_feature_encoder = feature_encoder if effective_drift_space == "feature" else "none"
+    effective_freeze_feature_encoder = (
+        freeze_feature_encoder if effective_drift_space == "feature" else True
+    )
     if name in ("cifar", "cifar10"):
         img_size = 32
     if depth_mode == "external":
@@ -838,8 +843,9 @@ def train(
         f"fog={fog_preset}, fog_type={fog_type}, beta={fog_config['beta_range']}, "
         f"blur={fog_config['blur_sigma_range']}, depth_mode={depth_mode}, "
         f"noise={noise_mode}, prediction={prediction_mode}, loss_mode={loss_mode}, "
-        f"drift_space={drift_space}, drift_positive_mode={drift_positive_mode}, "
-        f"feature_encoder={feature_encoder}, freeze_feature_encoder={freeze_feature_encoder}, "
+        f"drift_space={effective_drift_space}, drift_positive_mode={drift_positive_mode}, "
+        f"feature_encoder={effective_feature_encoder}, "
+        f"freeze_feature_encoder={effective_freeze_feature_encoder}, "
         f"lambda_l1={lambda_l1}, lambda_l2={lambda_l2}"
     )
 
@@ -855,10 +861,10 @@ def train(
         "noise_mode": noise_mode,
         "prediction_mode": prediction_mode,
         "loss_mode": loss_mode,
-        "drift_space": drift_space,
+        "drift_space": effective_drift_space,
         "drift_positive_mode": drift_positive_mode,
-        "feature_encoder": feature_encoder,
-        "freeze_feature_encoder": freeze_feature_encoder,
+        "feature_encoder": effective_feature_encoder,
+        "freeze_feature_encoder": effective_freeze_feature_encoder,
         "lambda_l1": lambda_l1,
         "lambda_l2": lambda_l2,
         "model_type": model_type,
@@ -937,18 +943,21 @@ def train(
     ).to(device)
     print(f"{model.__class__.__name__} params: {count_parameters(model):,}")
 
-    drift_feature_extractor, has_external_feature_encoder = build_drift_feature_extractor(
-        drift_space=drift_space,
-        feature_encoder=feature_encoder,
-        model=model,
-        in_channels=in_channels,
-        device=device,
-        freeze_feature_encoder=freeze_feature_encoder,
-    )
+    drift_feature_extractor: Optional[nn.Module] = None
+    has_external_feature_encoder = False
+    if uses_drift_loss and effective_drift_space == "feature":
+        drift_feature_extractor, has_external_feature_encoder = build_drift_feature_extractor(
+            drift_space=effective_drift_space,
+            feature_encoder=effective_feature_encoder,
+            model=model,
+            in_channels=in_channels,
+            device=device,
+            freeze_feature_encoder=effective_freeze_feature_encoder,
+        )
     train_feature_encoder = (
         drift_feature_extractor is not None
         and has_external_feature_encoder
-        and not freeze_feature_encoder
+        and not effective_freeze_feature_encoder
     )
     if drift_feature_extractor is not None:
         print(
@@ -991,10 +1000,10 @@ def train(
                 "noise_mode": noise_mode,
                 "prediction_mode": prediction_mode,
                 "loss_mode": loss_mode,
-                "drift_space": drift_space,
+                "drift_space": effective_drift_space,
                 "drift_positive_mode": drift_positive_mode,
-                "feature_encoder": feature_encoder,
-                "freeze_feature_encoder": freeze_feature_encoder,
+                "feature_encoder": effective_feature_encoder,
+                "freeze_feature_encoder": effective_freeze_feature_encoder,
                 "lambda_l1": lambda_l1,
                 "lambda_l2": lambda_l2,
                 "save_fog_debug": save_fog_debug,
@@ -1056,7 +1065,7 @@ def train(
                 drift_loss = compute_drift_loss(
                     x_hat,
                     x_clean,
-                    drift_space=drift_space,
+                    drift_space=effective_drift_space,
                     positive_mode=drift_positive_mode,
                     feature_extractor=drift_feature_extractor,
                 )
@@ -1448,10 +1457,22 @@ def main():
     p.add_argument("--noise_mode", choices=["random", "zero"], default="random")
     p.add_argument("--prediction_mode", choices=["direct", "residual"], default="direct")
     p.add_argument("--loss_mode", choices=["drift", "supervised", "mixed"], default="drift")
-    p.add_argument("--drift_space", "--drift_loss", dest="drift_space", choices=["pixel", "feature"], default="pixel")
+    p.add_argument(
+        "--drift_space",
+        "--drift_loss",
+        dest="drift_space",
+        choices=["pixel", "feature"],
+        default="pixel",
+        help="Drift space used for drift computation. --drift_loss is a deprecated alias.",
+    )
     p.add_argument("--drift_positive_mode", choices=["batch", "paired"], default="batch")
     p.add_argument("--feature_encoder", choices=["multiscale", "none"], default="none")
-    p.add_argument("--freeze_feature_encoder", action="store_true")
+    p.add_argument(
+        "--freeze_feature_encoder",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Freeze the feature encoder used by feature-space drift.",
+    )
     p.add_argument("--lambda_l1", type=float, default=0.0)
     p.add_argument("--lambda_l2", type=float, default=0.0)
     p.add_argument("--lr", type=float, default=2e-4)
