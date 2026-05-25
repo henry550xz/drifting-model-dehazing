@@ -60,7 +60,7 @@ def _make_depth_map(
     # Add broad fog blobs so the haze varies locally instead of looking flat.
     ys = torch.linspace(0.0, 1.0, height, device=device).view(1, 1, height, 1)
     xs = torch.linspace(0.0, 1.0, width, device=device).view(1, 1, 1, width)
-    n_blobs = int(torch.randint(2, 5, (1,), generator=generator).item())
+    n_blobs = int(torch.randint(2, 5, (1,), device=device, generator=generator).item())
     blobs = torch.zeros_like(d)
     for _ in range(n_blobs):
         cy = torch.empty(batch_size, 1, 1, 1, device=device).uniform_(0.0, 1.0, generator=generator)
